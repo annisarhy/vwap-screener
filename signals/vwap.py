@@ -103,73 +103,66 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     prev_high = high.shift(1)
     prev_mid  = mid.shift(1)
 
-    # ── LONG conditions ───────────────────────────────────────────────────────
-    # Primary: close above mid-line
-    long_close_above = close > mid
-
-    # Bounce confirmation: prev candle low touched or went below mid,
-    # current close recovered above mid
-    long_bounce = (prev_low <= prev_mid) & long_close_above
-
-    # RSI filter: not already overbought
-    long_rsi = rsi < 60
-
-    # Band context: price near lower band (stronger bounce signal)
+    # ── Band context ─────────────────────────────────────────────────────────
     band_width    = (upper - lower).replace(0, np.nan)
     dist_from_low = (close - lower) / band_width
-    long_near_low = dist_from_low < 0.5   # in lower half of band
+    long_near_low   = dist_from_low < 0.5   # lower half of band
+    short_near_high = dist_from_low >= 0.5  # upper half of band
+
+    # ── LONG conditions ───────────────────────────────────────────────────────
+    # Primary: close above mid-line (no RSI filter — RSI used for conviction only)
+    long_close_above = close > mid
+
+    # Strong: prev candle low touched mid, current close recovered above
+    long_bounce = (prev_low <= prev_mid) & long_close_above
+
+    # Strong LONG = bounce + in lower half of band
+    strong_long = long_bounce & long_near_low
+
+    # Base LONG = just close above mid (not already strong)
+    base_long = long_close_above & ~strong_long
 
     # ── SHORT conditions ──────────────────────────────────────────────────────
-    # Primary: close below mid-line
+    # Primary: close below mid-line (no RSI filter)
     short_close_below = close < mid
 
-    # Rejection confirmation: prev candle high touched or exceeded mid,
-    # current close fell back below mid
+    # Strong: prev candle high touched mid, current close fell back below
     short_rejection = (prev_high >= prev_mid) & short_close_below
 
-    # RSI filter: not already oversold
-    short_rsi = rsi > 40
+    # Strong SHORT = rejection + in upper half of band
+    strong_short = short_rejection & short_near_high
 
-    # Band context: price near upper band
-    short_near_high = dist_from_low > 0.5   # in upper half of band
+    # Base SHORT = just close below mid
+    base_short = short_close_below & ~strong_short
 
-    # ── Combine ───────────────────────────────────────────────────────────────
-    # Strong signals (bounce + RSI + band position)
-    strong_long  = long_bounce  & long_rsi  & long_near_low
-    strong_short = short_rejection & short_rsi & short_near_high
-
-    # Base signals (close above/below only — always shown with lower conviction)
-    base_long  = long_close_above  & long_rsi  & ~strong_long
-    base_short = short_close_below & short_rsi & ~strong_short
-
-    # Assign
+    # ── Assign signals ────────────────────────────────────────────────────────
     signal = pd.Series('NEUTRAL', index=d.index)
-    signal[base_long]   = 'LONG'
-    signal[base_short]  = 'SHORT'
-    signal[strong_long] = 'LONG_STRONG'
-    signal[strong_short]= 'SHORT_STRONG'
+    signal[base_long]    = 'LONG'
+    signal[base_short]   = 'SHORT'
+    signal[strong_long]  = 'LONG_STRONG'
+    signal[strong_short] = 'SHORT_STRONG'
     d['signal'] = signal
 
-    # Conviction score 1–10
-    conviction = pd.Series(0, index=d.index, dtype=float)
-
-    # Base: close above/below mid
-    conviction += (close > mid).astype(float) * -1 + \
-                  (close < mid).astype(float) * 1
-    # Absolute: just use sign
+    # ── Conviction score 1–10 ─────────────────────────────────────────────────
+    # Base signal starts at 3 (passes min_conviction=3 threshold)
     conviction = pd.Series(0.0, index=d.index)
-    conviction[base_long]   = 4
-    conviction[base_short]  = 4
-    conviction[strong_long] = 8
-    conviction[strong_short]= 8
+    conviction[base_long]    = 3
+    conviction[base_short]   = 3
+    conviction[strong_long]  = 6
+    conviction[strong_short] = 6
 
-    # Boost for RSI extremes
-    conviction += (rsi < 35).astype(float) * 2   # oversold → boost long
-    conviction += (rsi > 65).astype(float) * 2   # overbought → boost short
+    # Boost: RSI oversold (<40) → long more reliable
+    conviction[(rsi < 40) & signal.isin(['LONG','LONG_STRONG'])]  += 2
+    # Boost: RSI overbought (>60) → short more reliable
+    conviction[(rsi > 60) & signal.isin(['SHORT','SHORT_STRONG'])] += 2
 
-    # Boost for band position
-    conviction[long_near_low  & (signal.isin(['LONG','LONG_STRONG']))]  += 1
-    conviction[short_near_high & (signal.isin(['SHORT','SHORT_STRONG']))] += 1
+    # Boost: RSI extreme zones
+    conviction[(rsi < 30) & signal.isin(['LONG','LONG_STRONG'])]  += 1
+    conviction[(rsi > 70) & signal.isin(['SHORT','SHORT_STRONG'])] += 1
+
+    # Boost: band position matches direction
+    conviction[long_near_low   & signal.isin(['LONG','LONG_STRONG'])]   += 1
+    conviction[short_near_high & signal.isin(['SHORT','SHORT_STRONG'])]  += 1
 
     d['conviction'] = conviction.clip(0, 10).round(0).astype(int)
 

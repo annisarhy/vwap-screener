@@ -30,7 +30,7 @@ CONFIG = {
     'interval_min'      : int(os.getenv('SCREENER_INTERVAL', '60')),
     'timeframe'         : os.getenv('SCREENER_TIMEFRAME', '15m'),
     'top_n'             : int(os.getenv('SCREENER_TOP_N', '50')),
-    'min_conviction'    : int(os.getenv('SCREENER_MIN_CONVICTION', '3')),
+    'min_conviction'    : int(os.getenv('SCREENER_MIN_CONVICTION', '1')),
     'top_display'       : int(os.getenv('SCREENER_TOP_DISPLAY', '8')),
 }
 
