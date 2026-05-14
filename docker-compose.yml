@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  vwap-screener:
+    build: .
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - SCREENER_INTERVAL=60        # auto-run every 60 min
+      - SCREENER_TIMEFRAME=15m      # candle timeframe
+      - SCREENER_TOP_N=50           # top N coins by volume
+      - SCREENER_MIN_CONVICTION=3   # minimum conviction to show
+      - SCREENER_TOP_DISPLAY=8      # max coins per section in TG
+    restart: unless-stopped
