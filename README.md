@@ -79,3 +79,5 @@ Symbol      RSI   Dist    Conviction
 - **Signal**: Weekly VWAP + StdDev bands
 - **Notify**: Telegram Bot API
 - **Deploy**: Docker → Railway
+
+Vibe coding use claude
