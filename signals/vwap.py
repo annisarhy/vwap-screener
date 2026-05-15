@@ -1,20 +1,21 @@
 """
 signals/vwap.py
 ───────────────
-Weekly-anchored VWAP with ±1 StdDev bands.
+Weekly-anchored VWAP + FVG detection + Entry/SL/TP + Reason generator.
 
-Signal Logic (on 15m candles):
-───────────────────────────────
-  LONG  : candle close > VWAP weekly mid-line
-           AND previous candle low touched / crossed mid-line (bounce)
-           AND RSI(14) < 60  (not overbought)
+Signal Logic (30m candles):
+  LONG  : close > VWAP weekly mid
+  SHORT : close < VWAP weekly mid
 
-  SHORT : candle close < VWAP weekly mid-line
-           AND previous candle high touched / crossed mid-line (rejection)
-           AND RSI(14) > 40  (not oversold)
+  STRONG variant: bounce/rejection confirmed at mid-line
 
-VWAP weekly resets every Monday 00:00 UTC.
-Bands = VWAP ± 1 * rolling StdDev of (typical_price - VWAP).
+Entry  : close of signal candle
+SL     : entry ± 1.5 × ATR(14)
+TP     : VWAP upper band (long) / VWAP lower band (short)
+
+FVG    : 3-candle Fair Value Gap pattern
+  Bullish FVG: candle[i-2].high < candle[i].low   → gap not filled
+  Bearish FVG: candle[i-2].low  > candle[i].high  → gap not filled
 """
 
 import numpy as np
@@ -22,7 +23,7 @@ import pandas as pd
 from typing import Optional
 
 
-# ── RSI ───────────────────────────────────────────────────────────────────────
+# ── Indicators ────────────────────────────────────────────────────────────────
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain  = delta.clip(lower=0).ewm(com=period - 1, min_periods=period).mean()
@@ -31,111 +32,203 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, prev_close = df['high'], df['low'], df['close'].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, min_periods=period).mean()
+
+
 # ── Weekly-anchored VWAP ──────────────────────────────────────────────────────
 def compute_vwap_weekly(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute weekly-anchored VWAP + ±1 StdDev bands.
-    Anchor resets every Monday 00:00 UTC.
-
-    Returns df with added columns:
-      vwap_mid   — weekly VWAP (middle line)
-      vwap_upper — VWAP + 1 StdDev
-      vwap_lower — VWAP - 1 StdDev
+    Weekly-anchored VWAP + ±1 StdDev bands.
+    Resets every Monday 00:00 UTC.
+    Adds: vwap_mid, vwap_upper, vwap_lower
     """
     d = df.copy().sort_index()
-
-    # Typical price
     tp = (d['high'] + d['low'] + d['close']) / 3.0
     d['_tp']    = tp
     d['_tpvol'] = tp * d['volume']
 
-    # Week key: ISO year + week number → resets Monday 00:00 UTC
-    idx = d.index  # DatetimeIndex in UTC
-    week_key = idx.isocalendar().year.astype(str) + '_' + \
-               idx.isocalendar().week.astype(str).str.zfill(2)
+    idx      = d.index
+    week_key = (idx.isocalendar().year.astype(str) + '_' +
+                idx.isocalendar().week.astype(str).str.zfill(2))
     d['_week'] = week_key.values
 
-    # Cumulative sums within each week
     d['_cum_tpvol'] = d.groupby('_week', sort=False)['_tpvol'].cumsum()
     d['_cum_vol']   = d.groupby('_week', sort=False)['volume'].cumsum()
     d['vwap_mid']   = d['_cum_tpvol'] / d['_cum_vol'].replace(0, np.nan)
 
-    # Rolling StdDev of (tp - vwap) within each week → bands
     def _week_std(grp):
-        dev = (grp['_tp'] - grp['vwap_mid']) ** 2
-        return dev.expanding().mean() ** 0.5
+        return ((grp['_tp'] - grp['vwap_mid']) ** 2).expanding().mean() ** 0.5
 
-    d['_std'] = d.groupby('_week', group_keys=False).apply(_week_std)
-
+    d['_std']       = d.groupby('_week', group_keys=False).apply(_week_std)
     d['vwap_upper'] = d['vwap_mid'] + d['_std']
     d['vwap_lower'] = d['vwap_mid'] - d['_std']
 
-    # Cleanup temp cols
-    drop = ['_tp', '_tpvol', '_cum_tpvol', '_cum_vol', '_week', '_std']
+    drop = ['_tp','_tpvol','_cum_tpvol','_cum_vol','_week','_std']
     d.drop(columns=[c for c in drop if c in d.columns], inplace=True)
-
     return d
 
 
-# ── Signal generation ─────────────────────────────────────────────────────────
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
+# ── FVG Detection ─────────────────────────────────────────────────────────────
+def detect_fvg(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate LONG / SHORT / NEUTRAL signals on 15m candles.
+    Fair Value Gap (3-candle pattern):
+      Bullish FVG : high[i-2] < low[i]   → bullish gap between candle i-2 and i
+      Bearish FVG : low[i-2]  > high[i]  → bearish gap between candle i-2 and i
 
-    Columns added:
-      rsi           — RSI(14)
-      signal        — 'LONG' | 'SHORT' | 'NEUTRAL'
-      signal_reason — human-readable explanation
-      vwap_mid/upper/lower
+    Adds columns:
+      fvg_bullish  — bool: bullish FVG present on this candle
+      fvg_bearish  — bool: bearish FVG present
+      fvg_top      — upper edge of FVG zone
+      fvg_bottom   — lower edge of FVG zone
     """
+    h2 = df['high'].shift(2)
+    l2 = df['low'].shift(2)
+    h0 = df['high']
+    l0 = df['low']
+
+    df['fvg_bullish'] = l0 > h2          # gap above candle[i-2] high
+    df['fvg_bearish'] = h0 < l2          # gap below candle[i-2] low
+
+    # FVG zone edges
+    df['fvg_top']    = np.where(df['fvg_bullish'], l0,
+                       np.where(df['fvg_bearish'], l2, np.nan))
+    df['fvg_bottom'] = np.where(df['fvg_bullish'], h2,
+                       np.where(df['fvg_bearish'], h0, np.nan))
+    return df
+
+
+# ── Entry / SL / TP ───────────────────────────────────────────────────────────
+def compute_trade_levels(df: pd.DataFrame,
+                          atr_mult: float = 1.5) -> pd.DataFrame:
+    """
+    Entry : close of signal candle
+    SL    : entry ± atr_mult × ATR(14)
+    TP    : VWAP upper band (long) / lower band (short)
+    RR    : (TP - entry) / (entry - SL)  — computed per signal
+    """
+    df['atr'] = _atr(df)
+
+    # These will be set per-signal in generate_signals
+    df['entry'] = df['close']
+    df['sl_long']  = df['close'] - atr_mult * df['atr']
+    df['sl_short'] = df['close'] + atr_mult * df['atr']
+    df['tp_long']  = df['vwap_upper']
+    df['tp_short'] = df['vwap_lower']
+
+    # RR ratio
+    long_risk   = (df['entry'] - df['sl_long']).clip(lower=1e-10)
+    long_reward = (df['tp_long'] - df['entry']).clip(lower=0)
+    df['rr_long'] = (long_reward / long_risk).round(2)
+
+    short_risk   = (df['sl_short'] - df['entry']).clip(lower=1e-10)
+    short_reward = (df['entry'] - df['tp_short']).clip(lower=0)
+    df['rr_short'] = (short_reward / short_risk).round(2)
+
+    return df
+
+
+# ── Reason generator ──────────────────────────────────────────────────────────
+def build_reason(row: pd.Series, direction: str) -> str:
+    """
+    Build a human-readable reason string for a signal.
+    Checks: VWAP position, bounce/rejection, FVG, RSI zone.
+    """
+    parts = []
+
+    is_long  = 'LONG'  in direction
+    is_short = 'SHORT' in direction
+
+    # 1. VWAP position
+    dist = row.get('dist_pct', 0)
+    if is_long:
+        parts.append(f"Close di atas VWAP weekly mid ({dist:+.2f}%)")
+    else:
+        parts.append(f"Close di bawah VWAP weekly mid ({dist:+.2f}%)")
+
+    # 2. Bounce / rejection
+    if 'STRONG' in direction:
+        if is_long:
+            parts.append("Bounce terkonfirmasi di mid-line (low prev candle menyentuh VWAP)")
+        else:
+            parts.append("Rejection terkonfirmasi di mid-line (high prev candle menyentuh VWAP)")
+
+    # 3. FVG
+    if row.get('fvg_bullish') and is_long:
+        top    = row.get('fvg_top', 0)
+        bottom = row.get('fvg_bottom', 0)
+        parts.append(f"FVG Bullish terdeteksi 30m (zona {bottom:.4f}–{top:.4f})")
+    elif row.get('fvg_bearish') and is_short:
+        top    = row.get('fvg_top', 0)
+        bottom = row.get('fvg_bottom', 0)
+        parts.append(f"FVG Bearish terdeteksi 30m (zona {bottom:.4f}–{top:.4f})")
+
+    # 4. RSI context
+    rsi = row.get('rsi', 50)
+    if rsi < 30:
+        parts.append(f"RSI oversold ({rsi:.0f}) — momentum reversal tinggi")
+    elif rsi < 40:
+        parts.append(f"RSI {rsi:.0f} — area oversold")
+    elif rsi > 70:
+        parts.append(f"RSI overbought ({rsi:.0f}) — momentum reversal tinggi")
+    elif rsi > 60:
+        parts.append(f"RSI {rsi:.0f} — area overbought")
+    else:
+        parts.append(f"RSI netral ({rsi:.0f})")
+
+    # 5. Band position
+    band_pos = row.get('dist_from_low', 0.5)
+    if is_long and band_pos < 0.3:
+        parts.append("Harga di lower band — potensi reversal kuat")
+    elif is_short and band_pos > 0.7:
+        parts.append("Harga di upper band — potensi reversal kuat")
+
+    return " | ".join(parts)
+
+
+# ── Main signal generator ─────────────────────────────────────────────────────
+def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     d = compute_vwap_weekly(df)
+    d = detect_fvg(d)
+    d = compute_trade_levels(d)
     d['rsi'] = _rsi(d['close'])
 
-    close  = d['close']
-    high   = d['high']
-    low    = d['low']
-    mid    = d['vwap_mid']
-    upper  = d['vwap_upper']
-    lower  = d['vwap_lower']
-    rsi    = d['rsi']
+    close = d['close']
+    high  = d['high']
+    low   = d['low']
+    mid   = d['vwap_mid']
+    upper = d['vwap_upper']
+    lower = d['vwap_lower']
+    rsi   = d['rsi']
 
     prev_low  = low.shift(1)
     prev_high = high.shift(1)
     prev_mid  = mid.shift(1)
 
-    # ── Band context ─────────────────────────────────────────────────────────
-    band_width    = (upper - lower).replace(0, np.nan)
-    dist_from_low = (close - lower) / band_width
-    long_near_low   = dist_from_low < 0.5   # lower half of band
-    short_near_high = dist_from_low >= 0.5  # upper half of band
+    band_width      = (upper - lower).replace(0, np.nan)
+    dist_from_low   = (close - lower) / band_width
+    d['dist_from_low'] = dist_from_low
+    long_near_low   = dist_from_low < 0.5
+    short_near_high = dist_from_low >= 0.5
 
-    # ── LONG conditions ───────────────────────────────────────────────────────
-    # Primary: close above mid-line (no RSI filter — RSI used for conviction only)
+    # Signal classification
     long_close_above = close > mid
+    long_bounce      = (prev_low <= prev_mid) & long_close_above
+    strong_long      = long_bounce & long_near_low
 
-    # Strong: prev candle low touched mid, current close recovered above
-    long_bounce = (prev_low <= prev_mid) & long_close_above
-
-    # Strong LONG = bounce + in lower half of band
-    strong_long = long_bounce & long_near_low
-
-    # Base LONG = just close above mid (not already strong)
-    base_long = long_close_above & ~strong_long
-
-    # ── SHORT conditions ──────────────────────────────────────────────────────
-    # Primary: close below mid-line (no RSI filter)
     short_close_below = close < mid
+    short_rejection   = (prev_high >= prev_mid) & short_close_below
+    strong_short      = short_rejection & short_near_high
 
-    # Strong: prev candle high touched mid, current close fell back below
-    short_rejection = (prev_high >= prev_mid) & short_close_below
-
-    # Strong SHORT = rejection + in upper half of band
-    strong_short = short_rejection & short_near_high
-
-    # Base SHORT = just close below mid
+    base_long  = long_close_above  & ~strong_long
     base_short = short_close_below & ~strong_short
 
-    # ── Assign signals ────────────────────────────────────────────────────────
     signal = pd.Series('NEUTRAL', index=d.index)
     signal[base_long]    = 'LONG'
     signal[base_short]   = 'SHORT'
@@ -143,69 +236,71 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     signal[strong_short] = 'SHORT_STRONG'
     d['signal'] = signal
 
-    # ── Conviction score 1–10 ─────────────────────────────────────────────────
-    # Base signal starts at 3 (passes min_conviction=3 threshold)
+    # Conviction
     conviction = pd.Series(0.0, index=d.index)
     conviction[base_long]    = 3
     conviction[base_short]   = 3
     conviction[strong_long]  = 6
     conviction[strong_short] = 6
-
-    # Boost: RSI oversold (<40) → long more reliable
-    conviction[(rsi < 40) & signal.isin(['LONG','LONG_STRONG'])]  += 2
-    # Boost: RSI overbought (>60) → short more reliable
-    conviction[(rsi > 60) & signal.isin(['SHORT','SHORT_STRONG'])] += 2
-
-    # Boost: RSI extreme zones
-    conviction[(rsi < 30) & signal.isin(['LONG','LONG_STRONG'])]  += 1
-    conviction[(rsi > 70) & signal.isin(['SHORT','SHORT_STRONG'])] += 1
-
-    # Boost: band position matches direction
+    conviction[(rsi < 40) & signal.isin(['LONG','LONG_STRONG'])]   += 2
+    conviction[(rsi > 60) & signal.isin(['SHORT','SHORT_STRONG'])]  += 2
+    conviction[(rsi < 30) & signal.isin(['LONG','LONG_STRONG'])]   += 1
+    conviction[(rsi > 70) & signal.isin(['SHORT','SHORT_STRONG'])]  += 1
     conviction[long_near_low   & signal.isin(['LONG','LONG_STRONG'])]   += 1
     conviction[short_near_high & signal.isin(['SHORT','SHORT_STRONG'])]  += 1
 
+    # FVG conviction boost
+    conviction[d['fvg_bullish'] & signal.isin(['LONG','LONG_STRONG'])]   += 1
+    conviction[d['fvg_bearish'] & signal.isin(['SHORT','SHORT_STRONG'])]  += 1
+
     d['conviction'] = conviction.clip(0, 10).round(0).astype(int)
 
-    # Human-readable reason
-    def _reason(row):
-        if 'LONG' in str(row['signal']):
-            bounce = ' + bounce' if 'STRONG' in str(row['signal']) else ''
-            return f"Close above VWAP mid{bounce} | RSI {row['rsi']:.0f}"
-        elif 'SHORT' in str(row['signal']):
-            rej = ' + rejection' if 'STRONG' in str(row['signal']) else ''
-            return f"Close below VWAP mid{rej} | RSI {row['rsi']:.0f}"
-        return 'No signal'
-
-    d['signal_reason'] = d.apply(_reason, axis=1)
+    # dist_pct
+    d['dist_pct'] = (close - mid) / mid.replace(0, np.nan) * 100
 
     return d
 
 
-# ── Summary for one symbol ────────────────────────────────────────────────────
-def get_latest_signal(df_with_signals: pd.DataFrame,
-                      symbol: str) -> Optional[dict]:
-    """Extract the latest candle's signal info."""
-    if df_with_signals is None or len(df_with_signals) == 0:
+# ── Latest signal extractor ───────────────────────────────────────────────────
+def get_latest_signal(df: pd.DataFrame, symbol: str) -> Optional[dict]:
+    if df is None or len(df) == 0:
         return None
 
-    last = df_with_signals.iloc[-1]
+    last = df.iloc[-1]
     sig  = str(last.get('signal', 'NEUTRAL'))
-
     if sig == 'NEUTRAL':
         return None
+
+    is_long = 'LONG' in sig
+    entry   = float(last['close'])
+    sl      = float(last['sl_long']  if is_long else last['sl_short'])
+    tp      = float(last['tp_long']  if is_long else last['tp_short'])
+    rr      = float(last['rr_long']  if is_long else last['rr_short'])
+
+    row    = last.copy()
+    row['dist_pct']     = float(last.get('dist_pct', 0))
+    row['dist_from_low']= float(last.get('dist_from_low', 0.5))
+    reason = build_reason(row, sig)
 
     return {
         'symbol'     : symbol,
         'signal'     : sig,
         'conviction' : int(last.get('conviction', 0)),
-        'close'      : float(last['close']),
-        'vwap_mid'   : float(last.get('vwap_mid', 0)),
-        'vwap_upper' : float(last.get('vwap_upper', 0)),
-        'vwap_lower' : float(last.get('vwap_lower', 0)),
-        'rsi'        : float(last.get('rsi', 50)),
-        'reason'     : str(last.get('signal_reason', '')),
+        'close'      : entry,
+        'entry'      : entry,
+        'sl'         : round(sl, 6),
+        'tp'         : round(tp, 6),
+        'rr'         : round(rr, 2),
+        'atr'        : round(float(last.get('atr', 0)), 6),
+        'vwap_mid'   : round(float(last.get('vwap_mid', 0)), 6),
+        'vwap_upper' : round(float(last.get('vwap_upper', 0)), 6),
+        'vwap_lower' : round(float(last.get('vwap_lower', 0)), 6),
+        'rsi'        : round(float(last.get('rsi', 50)), 1),
+        'dist_pct'   : round(float(last.get('dist_pct', 0)), 2),
+        'fvg_bullish': bool(last.get('fvg_bullish', False)),
+        'fvg_bearish': bool(last.get('fvg_bearish', False)),
+        'fvg_top'    : round(float(last.get('fvg_top', 0) or 0), 6),
+        'fvg_bottom' : round(float(last.get('fvg_bottom', 0) or 0), 6),
+        'reason'     : reason,
         'timestamp'  : last.name,
-        # Distance from mid as % — useful for context
-        'dist_pct'   : (float(last['close']) - float(last.get('vwap_mid', last['close'])))
-                        / float(last.get('vwap_mid', last['close']) or 1) * 100,
     }

@@ -24,6 +24,7 @@ if not exist "data"     mkdir data
 if not exist "signals"  mkdir signals
 if not exist "screener" mkdir screener
 if not exist "notify"   mkdir notify
+if not exist "backtest" mkdir backtest
 
 echo       Folder data, signals, screener, notify dibuat.
 
@@ -32,6 +33,7 @@ echo. > data\__init__.py
 echo. > signals\__init__.py
 echo. > screener\__init__.py
 echo. > notify\__init__.py
+echo. > backtest\__init__.py
 
 echo       File __init__.py dibuat di semua subfolder.
 echo.

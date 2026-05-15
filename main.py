@@ -1,18 +1,21 @@
 """
 main.py
 ────────
-Entry point. Runs two threads:
-  1. Scheduler — runs screener every N minutes, sends result to Telegram
-  2. Telegram bot — listens for manual /run /status /help commands
+Entry point. Two threads:
+  1. Screener scheduler — auto-run every N min, log signals, evaluate outcomes
+  2. Telegram bot       — handle /run /status /summary /help
 
-Config via environment variables (set in Railway dashboard):
-  TELEGRAM_BOT_TOKEN   — from @BotFather
-  TELEGRAM_CHAT_ID     — your chat/group ID
-  SCREENER_INTERVAL    — minutes between auto-runs (default: 60)
-  SCREENER_TIMEFRAME   — default timeframe (default: 15m)
-  SCREENER_TOP_N       — coins to screen (default: 50)
-  SCREENER_MIN_CONVICTION — min conviction to show (default: 3)
-  SCREENER_TOP_DISPLAY — max coins shown per section in TG (default: 8)
+Daily summary sent at 00:00 UTC automatically.
+
+Env vars:
+  TELEGRAM_BOT_TOKEN       — from @BotFather
+  TELEGRAM_CHAT_ID         — your chat ID
+  SCREENER_INTERVAL        — minutes between auto-runs (default: 60)
+  SCREENER_TIMEFRAME       — default timeframe (default: 30m)
+  SCREENER_TOP_N           — coins to screen (default: 50)
+  SCREENER_MIN_CONVICTION  — min conviction to show (default: 1)
+  SCREENER_TOP_DISPLAY     — max coins per section in TG (default: 5)
+  SIGNAL_LOG_PATH          — path for signal log JSON (default: /app/data/signals_log.json)
 """
 
 import os
@@ -22,27 +25,29 @@ from datetime import datetime, timezone
 
 from screener.engine import run_screener
 from notify.telegram import send_result, TelegramBot
+from backtest.tracker import log_signal, evaluate_open_signals, compute_stats
+from backtest.summary import build_summary_message, send_daily_summary
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG = {
-    'telegram_token'    : os.getenv('TELEGRAM_BOT_TOKEN', ''),
-    'telegram_chat_id'  : os.getenv('TELEGRAM_CHAT_ID', ''),
-    'interval_min'      : int(os.getenv('SCREENER_INTERVAL', '60')),
-    'timeframe'         : os.getenv('SCREENER_TIMEFRAME', '15m'),
-    'top_n'             : int(os.getenv('SCREENER_TOP_N', '50')),
-    'min_conviction'    : int(os.getenv('SCREENER_MIN_CONVICTION', '1')),
-    'top_display'       : int(os.getenv('SCREENER_TOP_DISPLAY', '8')),
+    'telegram_token'   : os.getenv('TELEGRAM_BOT_TOKEN', ''),
+    'telegram_chat_id' : os.getenv('TELEGRAM_CHAT_ID', ''),
+    'interval_min'     : int(os.getenv('SCREENER_INTERVAL', '60')),
+    'timeframe'        : os.getenv('SCREENER_TIMEFRAME', '30m'),
+    'top_n'            : int(os.getenv('SCREENER_TOP_N', '50')),
+    'min_conviction'   : int(os.getenv('SCREENER_MIN_CONVICTION', '1')),
+    'top_display'      : int(os.getenv('SCREENER_TOP_DISPLAY', '5')),
 }
 
-# Global state for /status command
 _last_result: dict = {}
 _last_run_time: str = 'Never'
+_last_all_data: dict = {}   # store latest OHLCV for outcome evaluation
 
 
-# ── Screener runner ───────────────────────────────────────────────────────────
+# ── Run screener ──────────────────────────────────────────────────────────────
 def do_run(timeframe: str = None) -> dict:
-    global _last_result, _last_run_time
-    tf = timeframe or CONFIG['timeframe']
+    global _last_result, _last_run_time, _last_all_data
+    tf     = timeframe or CONFIG['timeframe']
     result = run_screener(
         timeframe=tf,
         top_n=CONFIG['top_n'],
@@ -50,54 +55,81 @@ def do_run(timeframe: str = None) -> dict:
     )
     _last_result   = result
     _last_run_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+    # Log all new signals to backtest tracker
+    for sig in result['longs'] + result['shorts']:
+        log_signal(sig)
+
+    # Evaluate open signals against new price data
+    if hasattr(result, '_all_data'):
+        _last_all_data = result['_all_data']
+
     return result
 
 
 def get_status() -> str:
     if not _last_result:
-        return '📭 No runs yet. Send /run to start.'
+        return '📭 Belum ada run. Kirim /run untuk mulai.'
     s = _last_result.get('stats', {})
+    stats = compute_stats(days=7)
     return (
-        f'📊 <b>Last Run Status</b>\n'
+        f'📊 <b>Status Run Terakhir</b>\n'
         f'🕐 {_last_run_time}\n'
-        f'⏱ Timeframe: {_last_result.get("timeframe","?")}\n\n'
-        f'🔍 Scanned: {s.get("total_scanned",0)} coins\n'
-        f'🟢 Long signals : {s.get("long_count",0)} '
+        f'⏱ Timeframe : {_last_result.get("timeframe","?")}\n'
+        f'🔍 Scanned  : {s.get("total_scanned",0)} coins\n'
+        f'🟢 Long     : {s.get("long_count",0)}  '
         f'(🔥 strong: {s.get("strong_long",0)})\n'
-        f'🔴 Short signals: {s.get("short_count",0)} '
-        f'(🔥 strong: {s.get("strong_short",0)})\n'
+        f'🔴 Short    : {s.get("short_count",0)}  '
+        f'(🔥 strong: {s.get("strong_short",0)})\n\n'
+        f'📈 <b>Backtest 7 Hari</b>\n'
+        f'Win rate    : {stats["win_rate"]:.1f}%\n'
+        f'Total PnL   : {stats["total_pnl"]:+.2f}%\n'
+        f'TP/SL/Open  : {stats["tp"]}/{stats["sl"]}/{stats["open"]}'
     )
 
 
-# ── Scheduler thread ──────────────────────────────────────────────────────────
+def get_summary(days: int = 7) -> str:
+    return build_summary_message(days)
+
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 def scheduler_loop():
-    """Run screener every N minutes and push to Telegram."""
     interval_sec = CONFIG['interval_min'] * 60
+    last_summary_date = None
     print(f'[scheduler] Auto-run every {CONFIG["interval_min"]} min')
 
     while True:
         try:
-            print(f'[scheduler] Running screener...')
+            # Run screener
+            print('[scheduler] Running screener...')
             result = do_run()
             send_result(result, CONFIG['telegram_chat_id'],
                         top_n=CONFIG['top_display'])
-            print(f'[scheduler] Done. Next run in {CONFIG["interval_min"]} min.')
+
+            # Daily summary at 00:00 UTC
+            now = datetime.now(timezone.utc)
+            today = now.date()
+            if now.hour == 0 and last_summary_date != today:
+                print('[scheduler] Sending daily backtest summary...')
+                send_daily_summary(CONFIG['telegram_chat_id'], days=7)
+                last_summary_date = today
+
+            print(f'[scheduler] Done. Next in {CONFIG["interval_min"]} min.')
         except Exception as e:
             print(f'[scheduler] Error: {e}')
+
         time.sleep(interval_sec)
 
 
-# ── Validate config ───────────────────────────────────────────────────────────
+# ── Validate ──────────────────────────────────────────────────────────────────
 def validate():
-    missing = [k for k in ('telegram_token', 'telegram_chat_id')
-               if not CONFIG[k]]
+    missing = []
+    if not CONFIG['telegram_token']:
+        missing.append('TELEGRAM_BOT_TOKEN')
+    if not CONFIG['telegram_chat_id']:
+        missing.append('TELEGRAM_CHAT_ID')
     if missing:
-        raise ValueError(
-            f'Missing env vars: '
-            + ', '.join({'telegram_token': 'TELEGRAM_BOT_TOKEN',
-                         'telegram_chat_id': 'TELEGRAM_CHAT_ID'}[k]
-                        for k in missing)
-        )
+        raise ValueError(f'Missing env vars: {", ".join(missing)}')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -109,27 +141,28 @@ def main():
     print(f'  Timeframe : {CONFIG["timeframe"]}')
     print(f'  Top N     : {CONFIG["top_n"]} coins')
     print(f'  Interval  : every {CONFIG["interval_min"]} min')
-    print(f'  Chat ID   : {CONFIG["telegram_chat_id"]}')
+    print(f'  Sources   : Bybit + OKX + Gate.io (averaged)')
     print('═' * 60)
 
-    # Run once immediately on startup
-    print('\n[startup] Running initial screener...')
+    # Initial run
+    print('\n[startup] Initial run...')
     try:
         result = do_run()
         send_result(result, CONFIG['telegram_chat_id'],
                     top_n=CONFIG['top_display'])
     except Exception as e:
-        print(f'[startup] Initial run error: {e}')
+        print(f'[startup] Error: {e}')
 
-    # Start scheduler in background thread
-    sched = threading.Thread(target=scheduler_loop, daemon=True)
-    sched.start()
+    # Scheduler thread
+    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t.start()
 
-    # Start Telegram bot in main thread (blocking)
+    # Bot (main thread, blocking)
     bot = TelegramBot(
         chat_id=CONFIG['telegram_chat_id'],
         on_run_cmd=do_run,
         on_status_cmd=get_status,
+        on_summary_cmd=get_summary,
     )
     bot.start_polling()
 
