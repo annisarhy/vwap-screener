@@ -2,16 +2,20 @@
 main.py
 ──────────────────────────────────────────────────
 Entry point.  Threads:
-  1. Screener 5m   — auto-run setiap candle 5m
-  2. Screener 15m  — auto-run setiap candle 15m
-  3. Telegram bot  — handle /run /status /summary /help
-  4. Sheets price  — update harga realtime di Google Sheets
+  1. Screener 15m  — auto-run setiap candle 15m
+  2. Telegram bot  — handle /run /status /summary /help
+  3. Sheets price  — update harga + backtest status di Google Sheets
+
+Rules pengiriman sinyal:
+  • Hanya 15m (5m dihapus — terlalu noise)
+  • Coin yang sudah ada posisi OPEN / TP1 di sheet TIDAK dikirim ulang
+    sampai posisinya close (hit SL / TP2)
+  • Dedup per run: key = DIRECTION:SYMBOL agar tidak kirim 2x dalam 1 scan
 
 Env vars:
   TELEGRAM_BOT_TOKEN       — dari @BotFather
   TELEGRAM_CHAT_ID         — chat ID kamu
-  SCREENER_INTERVAL_5M     — override interval 5m (detik, default: 300)
-  SCREENER_INTERVAL_15M    — override interval 15m (detik, default: 900)
+  SCREENER_INTERVAL        — interval scan dalam detik (default: 900 = 15m)
   SCREENER_TOP_N           — jumlah coin yang di-scan (default: 50)
   SCREENER_MIN_CONVICTION  — min conviction 1=Low 2=Med 3=High (default: 1)
   SCREENER_TOP_DISPLAY     — max coin per summary di TG (default: 5)
@@ -32,9 +36,10 @@ from screener.engine import run_screener
 from notify.telegram import send_result, send_signal, TelegramBot
 from notify.sheets import (
     init_sheets,
-    log_signal       as sheets_log,
+    log_signal        as sheets_log,
     price_updater_loop,
     get_sheet_stats,
+    has_open_position,
 )
 
 # Optional backtest
@@ -45,29 +50,27 @@ try:
 except ImportError:
     HAS_BACKTEST = False
     def bt_log(sig): pass
-    def compute_stats(days=7): return {"win_rate":0,"total_pnl":0,"tp":0,"sl":0,"open":0}
+    def compute_stats(days=7): return {"win_rate": 0, "total_pnl": 0, "tp": 0, "sl": 0, "open": 0}
     def build_summary_message(days=7): return "📊 Backtest module not available."
     def send_daily_summary(chat_id, days=7): pass
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG = {
-    "telegram_token"    : os.getenv("TELEGRAM_BOT_TOKEN", ""),
-    "telegram_chat_id"  : os.getenv("TELEGRAM_CHAT_ID", ""),
-    "interval_5m_sec"   : int(os.getenv("SCREENER_INTERVAL_5M",  "300")),
-    "interval_15m_sec"  : int(os.getenv("SCREENER_INTERVAL_15M", "900")),
-    "top_n"             : int(os.getenv("SCREENER_TOP_N", "50")),
-    "min_conviction"    : int(os.getenv("SCREENER_MIN_CONVICTION", "1")),
-    "top_display"       : int(os.getenv("SCREENER_TOP_DISPLAY", "5")),
-    "sheets_enabled"    : False,
+    "telegram_token"  : os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "interval_sec"    : int(os.getenv("SCREENER_INTERVAL", "900")),
+    "top_n"           : int(os.getenv("SCREENER_TOP_N", "50")),
+    "min_conviction"  : int(os.getenv("SCREENER_MIN_CONVICTION", "1")),
+    "top_display"     : int(os.getenv("SCREENER_TOP_DISPLAY", "5")),
+    "sheets_enabled"  : False,
 }
 
-_last_results: dict[str, dict] = {}   # tf → last result
+_last_result: dict  = {}
 _last_run_time: str = "Never"
 
-# Dedup: key = "DIRECTION:SYMBOL:TF"  → set per scheduler tick
-_alerted_5m:  set[str] = set()
-_alerted_15m: set[str] = set()
+# Dedup dalam satu run: hindari kirim sinyal yang sama 2x di scan yang sama
+_alerted_this_run: set[str] = set()
 
 
 # ── Core run ──────────────────────────────────────────────────────────────────
@@ -77,60 +80,73 @@ def do_run(timeframe: str = "15m") -> dict:
         top_n          = CONFIG["top_n"],
         min_conviction = CONFIG["min_conviction"],
     )
-    _last_results[timeframe] = result
-    global _last_run_time
+    global _last_result, _last_run_time
+    _last_result   = result
     _last_run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
     for sig in result["longs"] + result["shorts"]:
         bt_log(sig)
     return result
 
 
-def _dispatch_signals(result: dict, alerted: set[str]) -> None:
-    """Send Telegram + log to Sheets for new signals only."""
+def _dispatch_signals(result: dict) -> None:
+    """
+    Kirim sinyal ke Telegram + catat ke Sheets.
+
+    Filter berlapis:
+      1. Dedup dalam run ini (key = DIRECTION:SYMBOL)
+      2. Skip jika coin masih OPEN/TP1 di sheet (posisi belum close)
+    """
+    sent = 0
+    skipped_dedup   = 0
+    skipped_open    = 0
+
     for sig in result["longs"] + result["shorts"]:
-        key = f"{sig['direction']}:{sig['symbol']}:{sig['timeframe']}"
-        if key in alerted:
+        sym  = sig["symbol"]
+        dirn = sig["direction"]
+        key  = f"{dirn}:{sym}"
+
+        # ── Filter 1: dedup dalam run ini ────────────────────────────
+        if key in _alerted_this_run:
+            skipped_dedup += 1
             continue
 
-        # ── Telegram ────────────────────────────────────────────────
+        # ── Filter 2: posisi masih OPEN di sheet ─────────────────────
+        if CONFIG["sheets_enabled"] and has_open_position(sym, dirn):
+            print(f"[dispatch] Skip {dirn} {sym} — masih OPEN di sheet")
+            skipped_open += 1
+            continue
+
+        # ── Kirim ────────────────────────────────────────────────────
         send_signal(sig, CONFIG["telegram_chat_id"])
-        alerted.add(key)
+        _alerted_this_run.add(key)
+        sent += 1
         time.sleep(0.3)
 
-        # ── Google Sheets ────────────────────────────────────────────
         if CONFIG["sheets_enabled"]:
             sheets_log(sig)
             time.sleep(0.1)
 
-    alerted.clear()   # reset dedup after full dispatch
+    # Reset dedup setelah satu run selesai
+    _alerted_this_run.clear()
+
+    print(f"[dispatch] Sent={sent}  skip_dedup={skipped_dedup}  skip_open={skipped_open}")
 
 
-# ── Scheduler loops ───────────────────────────────────────────────────────────
-def scheduler_5m():
-    print(f"[5m] Scheduler started (every {CONFIG['interval_5m_sec']}s)")
-    while True:
-        try:
-            result = do_run("5m")
-            if result["longs"] or result["shorts"]:
-                _dispatch_signals(result, _alerted_5m)
-            else:
-                print("[5m] No signals.")
-        except Exception as e:
-            print(f"[5m] Error: {e}")
-        time.sleep(CONFIG["interval_5m_sec"])
-
-
-def scheduler_15m():
-    print(f"[15m] Scheduler started (every {CONFIG['interval_15m_sec']}s)")
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+def scheduler_loop():
+    interval = CONFIG["interval_sec"]
+    print(f"[scheduler] 15m only, every {interval}s")
     last_daily = None
+
     while True:
         try:
+            print("[scheduler] Running 15m screener...")
             result = do_run("15m")
+
             if result["longs"] or result["shorts"]:
-                _dispatch_signals(result, _alerted_15m)
+                _dispatch_signals(result)
             else:
-                print("[15m] No signals.")
+                print("[scheduler] No signals.")
 
             # Daily summary @ 00:00 UTC
             now   = datetime.now(timezone.utc)
@@ -140,26 +156,24 @@ def scheduler_15m():
                 last_daily = today
 
         except Exception as e:
-            print(f"[15m] Error: {e}")
-        time.sleep(CONFIG["interval_15m_sec"])
+            print(f"[scheduler] Error: {e}")
+
+        time.sleep(interval)
 
 
 # ── Status / summary ──────────────────────────────────────────────────────────
 def get_status() -> str:
     lines = [f"📊 <b>Status</b>  •  {_last_run_time}"]
 
-    for tf in ("5m", "15m"):
-        r = _last_results.get(tf)
-        if not r:
-            continue
+    r = _last_result
+    if r:
         s = r.get("stats", {})
         lines.append(
-            f"\n⏱ <b>{tf}</b>  scanned {s.get('total_scanned',0)} coins\n"
-            f"🟢 Long  {s.get('long_count',0)}  (🔥 {s.get('strong_long',0)})\n"
-            f"🔴 Short {s.get('short_count',0)}  (🔥 {s.get('strong_short',0)})"
+            f"\n⏱ <b>15m</b>  scanned {s.get('total_scanned', 0)} coins\n"
+            f"🟢 Long  {s.get('long_count', 0)}  (🔥 {s.get('strong_long', 0)})\n"
+            f"🔴 Short {s.get('short_count', 0)}  (🔥 {s.get('strong_short', 0)})"
         )
 
-    # Backtest
     stats = compute_stats(days=7)
     lines.append(
         f"\n📈 <b>Backtest 7 hari</b>\n"
@@ -168,17 +182,16 @@ def get_status() -> str:
         f"TP / SL   : {stats['tp']} / {stats['sl']}"
     )
 
-    # Sheets stats
     if CONFIG["sheets_enabled"]:
         ss = get_sheet_stats()
         if ss:
             lines.append(
                 f"\n📋 <b>Google Sheets</b>\n"
-                f"Total logged : {ss.get('total',0)}\n"
-                f"Open         : {ss.get('open',0)}\n"
-                f"TP2 ✅       : {ss.get('tp2',0)}\n"
-                f"SL ❌        : {ss.get('sl',0)}\n"
-                f"Win rate     : {ss.get('win_rate',0):.1f}%"
+                f"Total logged : {ss.get('total', 0)}\n"
+                f"Open         : {ss.get('open', 0)}\n"
+                f"TP2 ✅       : {ss.get('tp2', 0)}\n"
+                f"SL ❌        : {ss.get('sl', 0)}\n"
+                f"Win rate     : {ss.get('win_rate', 0):.1f}%"
             )
 
     return "\n".join(lines)
@@ -202,42 +215,36 @@ def validate():
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     validate()
-
-    # Google Sheets
     CONFIG["sheets_enabled"] = init_sheets()
 
     print("═" * 60)
-    print(" VWAP WEEKLY SCREENER — multi-TF + Sheets edition")
-    print(f" Timeframes  : 5m  (every {CONFIG['interval_5m_sec']//60} min)")
-    print(f"               15m (every {CONFIG['interval_15m_sec']//60} min)")
+    print(" VWAP WEEKLY SCREENER")
+    print(f" Timeframe   : 15m only  (5m disabled — too noisy)")
+    print(f" Interval    : every {CONFIG['interval_sec']//60} min")
     print(f" Top N       : {CONFIG['top_n']} coins")
     print(f" Entry zone  : FVG Bullish / Bearish")
     print(f" Min RR      : 1:2")
+    print(f" Dedup       : skip coin yg masih OPEN di sheet")
     print(f" Telegram    : ✅")
-    print(f" Google Sheets: {'✅ connected' if CONFIG['sheets_enabled'] else '❌ disabled (set GOOGLE_SHEET_ID)'}")
+    print(f" Google Sheets: {'✅ connected' if CONFIG['sheets_enabled'] else '❌ disabled'}")
     print("═" * 60)
 
     # ── Initial run ──────────────────────────────────────────────────
-    for tf in ("5m", "15m"):
-        try:
-            result = do_run(tf)
-            send_result(result, CONFIG["telegram_chat_id"],
-                        top_n=CONFIG["top_display"])
-            if CONFIG["sheets_enabled"]:
-                for sig in result["longs"] + result["shorts"]:
+    try:
+        result = do_run("15m")
+        send_result(result, CONFIG["telegram_chat_id"], top_n=CONFIG["top_display"])
+        if CONFIG["sheets_enabled"]:
+            for sig in result["longs"] + result["shorts"]:
+                if not has_open_position(sig["symbol"], sig["direction"]):
                     sheets_log(sig)
                     time.sleep(0.1)
-        except Exception as e:
-            print(f"[startup:{tf}] {e}")
+    except Exception as e:
+        print(f"[startup] {e}")
 
     # ── Background threads ───────────────────────────────────────────
-    threads = [
-        threading.Thread(target=scheduler_5m,   daemon=True),
-        threading.Thread(target=scheduler_15m,  daemon=True),
-    ]
+    threads = [threading.Thread(target=scheduler_loop, daemon=True)]
     if CONFIG["sheets_enabled"]:
         threads.append(threading.Thread(target=price_updater_loop, daemon=True))
-
     for t in threads:
         t.start()
 

@@ -452,3 +452,31 @@ def get_sheet_stats() -> dict:
         }
     except Exception:
         return {}
+
+
+# ── Open position guard ───────────────────────────────────────────────────────
+def has_open_position(symbol: str, direction: str) -> bool:
+    """
+    Return True jika coin ini masih punya sinyal OPEN atau TP1
+    (belum hit SL/TP2) di sheet — sehingga sinyal baru tidak perlu dikirim.
+
+    Kalau Sheets disabled, selalu return False (tidak ada throttling).
+    """
+    if not _enabled or _ws is None:
+        return False
+    try:
+        with _lock:
+            rows = _ws.get_all_values()[1:]   # skip header
+        for row in rows:
+            if len(row) < 17:
+                continue
+            row_sym   = row[COL["Symbol"]    - 1].upper()
+            row_dir   = row[COL["Direction"] - 1].upper()
+            row_stat  = row[COL["Status"]    - 1]
+            if (row_sym == symbol.upper()
+                    and row_dir == direction.upper()
+                    and row_stat in ("OPEN", "TP1", "")):
+                return True
+        return False
+    except Exception:
+        return False   # fail-open: kalau error, izinkan sinyal lewat
