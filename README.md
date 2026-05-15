@@ -75,7 +75,9 @@ Symbol      RSI   Dist    Conviction
 
 ## Stack
 
-- **Data**: Bybit Perpetuals via CCXT (tidak diblock)
+- **Data**: Bybit + Gate + OKX Perpetuals via CCXT
 - **Signal**: Weekly VWAP + StdDev bands
 - **Notify**: Telegram Bot API
 - **Deploy**: Docker → Railway
+
+Vibe coding use claude
