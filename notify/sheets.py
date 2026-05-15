@@ -306,31 +306,46 @@ def _backtest_resolve(
     return "OPEN", curr
 
 
-def price_updater_loop() -> None:
-    """
-    Background thread: scan all OPEN/TP1 rows.
-    • Sinyal < 2 candle lama  → cek harga live
-    • Sinyal lebih lama       → replay candle historis (backtest)
-    Runs every PRICE_REFRESH_SEC seconds.
-    """
-    if not _enabled:
-        return
-    print(f"[sheets] Price updater + backtest resolver running every {PRICE_REFRESH_SEC}s...")
-    while True:
-        try:
-            _refresh_prices()
-        except Exception as e:
-            print(f"[sheets] price_updater_loop error: {e}")
-        time.sleep(PRICE_REFRESH_SEC)
-
-
 # Map timeframe string → candle duration in minutes
 _TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
                "1h": 60, "2h": 120, "4h": 240, "1d": 1440}
 
+# Interval backtest resolver (lebih jarang dari live price update)
+BACKTEST_RESOLVE_SEC = int(os.getenv("BACKTEST_RESOLVE_SEC", "300"))  # default 5 menit
 
-def _refresh_prices() -> None:
-    """Read all OPEN/TP1 rows, resolve status via candle replay or live price."""
+
+def price_updater_loop() -> None:
+    """
+    Dua tugas dipisah:
+      Thread A (tiap PRICE_REFRESH_SEC = 60s) → update kolom O & P saja (harga live + PnL)
+      Thread B (tiap BACKTEST_RESOLVE_SEC = 300s) → replay candle, update Status (TP/SL)
+    Pemisahan ini memastikan harga live SELALU terupdate meski backtest resolver lambat.
+    """
+    if not _enabled:
+        return
+    print(f"[sheets] Live price updater: every {PRICE_REFRESH_SEC}s")
+    print(f"[sheets] Backtest resolver : every {BACKTEST_RESOLVE_SEC}s")
+
+    # Thread B — backtest resolver (background dari background)
+    import threading
+    t = threading.Thread(target=_backtest_resolve_loop, daemon=True)
+    t.start()
+
+    # Thread A — live price (main loop)
+    while True:
+        try:
+            _update_live_prices()
+        except Exception as e:
+            print(f"[sheets] live price error: {e}")
+        time.sleep(PRICE_REFRESH_SEC)
+
+
+def _update_live_prices() -> None:
+    """
+    Ambil harga REALTIME semua coin yg masih OPEN/TP1,
+    update kolom Current Price (O) dan PnL % (P) saja.
+    Tidak menyentuh kolom Status — itu urusan _backtest_resolve_loop.
+    """
     if _ws is None:
         return
 
@@ -340,21 +355,98 @@ def _refresh_prices() -> None:
     if len(all_rows) <= 1:
         return
 
-    open_rows: list[tuple[int, list]] = []
+    # Kumpulkan baris OPEN/TP1 beserta data yang dibutuhkan
+    open_rows = []
     for i, row in enumerate(all_rows[1:], start=2):
         if len(row) < 17:
             continue
-        status = row[COL["Status"] - 1] if len(row) >= COL["Status"] else ""
+        status = row[COL["Status"] - 1]
         if status in ("OPEN", "TP1", ""):
             open_rows.append((i, row))
 
     if not open_rows:
         return
 
-    updates: list[dict] = []
-    now_utc = datetime.now(timezone.utc)
+    # Fetch harga per symbol unik (batch)
+    symbols = {row[COL["Symbol"] - 1] for _, row in open_rows}
+    prices: dict[str, float] = {}
+    for sym in symbols:
+        p = _fetch_price(sym)
+        if p:
+            prices[sym] = p
+        time.sleep(0.08)
+
+    if not prices:
+        print("[sheets] live: semua fetch gagal")
+        return
+
+    # Build batch update — hanya kolom O (Current Price) dan P (PnL %)
+    price_col = _col_letter(COL["Current Price"])
+    pnl_col   = _col_letter(COL["PnL %"])
+    updates   = []
 
     for row_num, row in open_rows:
+        sym  = row[COL["Symbol"]    - 1]
+        dirn = row[COL["Direction"] - 1]
+        curr = prices.get(sym)
+        if curr is None:
+            continue
+        try:
+            entry = float(row[COL["Entry"] - 1])
+        except (ValueError, IndexError):
+            continue
+
+        pnl = _calc_pnl(dirn, entry, curr)
+        updates.append({
+            "range" : f"{price_col}{row_num}:{pnl_col}{row_num}",
+            "values": [[curr, pnl]],
+        })
+
+    if updates:
+        try:
+            with _lock:
+                _ws.batch_update(updates, value_input_option="USER_ENTERED")
+            print(f"[sheets] live: updated {len(updates)} prices")
+        except Exception as e:
+            print(f"[sheets] live batch_update error: {e}")
+
+
+def _backtest_resolve_loop() -> None:
+    """
+    Background thread (lebih jarang): replay candle untuk cek TP/SL.
+    Update kolom Status (Q) + warna baris.
+    """
+    while True:
+        time.sleep(BACKTEST_RESOLVE_SEC)
+        try:
+            _run_backtest_resolver()
+        except Exception as e:
+            print(f"[sheets] backtest resolver error: {e}")
+
+
+def _run_backtest_resolver() -> None:
+    """Replay candle historis untuk tiap OPEN/TP1 row, update Status."""
+    if _ws is None:
+        return
+
+    with _lock:
+        all_rows = _ws.get_all_values()
+
+    if len(all_rows) <= 1:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    status_col_letter = _col_letter(COL["Status"])
+    updates = []
+    to_recolor: list[tuple[int, str]] = []
+
+    for i, row in enumerate(all_rows[1:], start=2):
+        if len(row) < 17:
+            continue
+        cur_status = row[COL["Status"] - 1]
+        if cur_status not in ("OPEN", "TP1", ""):
+            continue
+
         sym  = row[COL["Symbol"]    - 1]
         dirn = row[COL["Direction"] - 1]
         tf   = row[COL["Timeframe"] - 1] or "15m"
@@ -367,60 +459,49 @@ def _refresh_prices() -> None:
         except (ValueError, IndexError):
             continue
 
-        # Parse signal timestamp
         try:
-            ts_str = row[COL["Timestamp (UTC)"] - 1]
+            ts_str    = row[COL["Timestamp (UTC)"] - 1]
             signal_ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except Exception:
-            signal_ts = now_utc
+            continue
 
-        # Decide: use historical replay or live price
         tf_min  = _TF_MINUTES.get(tf, 15)
         age_min = (now_utc - signal_ts).total_seconds() / 60
 
-        if age_min > tf_min * 2:
-            # Sinyal sudah lebih dari 2 candle lama → replay historis
-            status, exit_price = _backtest_resolve(
-                sym, dirn, tf, entry, sl, tp1, tp2, signal_ts
-            )
-        else:
-            # Sinyal masih fresh → cek harga live
-            curr = _fetch_price(sym) or entry
-            status    = _resolve_live(dirn, entry, sl, tp1, tp2, curr)
-            exit_price = curr
+        # Hanya replay kalau sudah lewat minimal 1 candle
+        if age_min < tf_min:
+            continue
 
-        time.sleep(0.15)   # rate limit
+        new_status, _ = _backtest_resolve(sym, dirn, tf, entry, sl, tp1, tp2, signal_ts)
+        time.sleep(0.2)
 
-        pnl = _calc_pnl(dirn, entry, exit_price)
-
-        price_col  = _col_letter(COL["Current Price"])
-        pnl_col    = _col_letter(COL["PnL %"])
-        status_col = _col_letter(COL["Status"])
-
-        updates.append({
-            "range" : f"{price_col}{row_num}:{status_col}{row_num}",
-            "values": [[exit_price, pnl, status]],
-        })
-
-        # Re-color closed rows
-        if status in ("TP2 ✅", "SL ❌"):
-            try:
-                color = (
-                    {"red": 0.72, "green": 0.93, "blue": 0.72}
-                    if status == "TP2 ✅"
-                    else {"red": 0.95, "green": 0.72, "blue": 0.72}
-                )
-                _ws.format(f"A{row_num}:R{row_num}", {"backgroundColor": color})
-            except Exception:
-                pass
+        if new_status != cur_status:
+            updates.append({
+                "range" : f"{status_col_letter}{i}",
+                "values": [[new_status]],
+            })
+            if new_status in ("TP2 ✅", "SL ❌"):
+                to_recolor.append((i, new_status))
 
     if updates:
         try:
             with _lock:
                 _ws.batch_update(updates, value_input_option="USER_ENTERED")
-            print(f"[sheets] Resolved {len(updates)} rows.")
+            print(f"[sheets] resolver: updated {len(updates)} statuses")
         except Exception as e:
-            print(f"[sheets] batch_update error: {e}")
+            print(f"[sheets] resolver batch_update error: {e}")
+
+    # Recolor closed rows AFTER batch update
+    for row_num, status in to_recolor:
+        try:
+            color = (
+                {"red": 0.72, "green": 0.93, "blue": 0.72}
+                if status == "TP2 ✅"
+                else {"red": 0.95, "green": 0.72, "blue": 0.72}
+            )
+            _ws.format(f"A{row_num}:R{row_num}", {"backgroundColor": color})
+        except Exception:
+            pass
 
 
 def _col_letter(n: int) -> str:
