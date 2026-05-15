@@ -1,246 +1,297 @@
 """
 notify/telegram.py
-──────────────────
-Telegram notifier + bot command handler.
+──────────────────────────────────────────────────
+Telegram notifier + bot polling.
 
-Commands:
-  /run [tf]     — run screener now
-  /status       — last run info
-  /summary      — backtest summary (7 days)
-  /summary 30   — backtest summary (30 days)
-  /help         — commands
+send_signal(sig, chat_id)       → send ONE signal immediately
+send_result(result, chat_id)    → send full screener run summary
+TelegramBot                     → polling bot for /run /status /help
 """
+
+from __future__ import annotations
 
 import os
 import time
 import requests
+import threading
 from datetime import datetime, timezone
-from typing import Optional
-
-TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN', '')}"
+from typing import Callable, Optional
 
 
-def _conviction_label(score: int) -> str:
-    if score >= 9:  return '🔥 Very High'
-    if score >= 7:  return '🟢 High'
-    if score >= 5:  return '🟠 Medium'
-    if score >= 3:  return '🟡 Low'
-    return '🔘 Very Low'
-
-def _signal_emoji(sig: str) -> str:
-    if sig == 'LONG_STRONG':  return '🟢🔥'
-    if sig == 'LONG':         return '🟢'
-    if sig == 'SHORT_STRONG': return '🔴🔥'
-    if sig == 'SHORT':        return '🔴'
-    return '⚪'
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
 
-# ── Format one signal card ────────────────────────────────────────────────────
-def fmt_signal_card(r: dict) -> str:
-    sym    = r['symbol']
-    emoji  = _signal_emoji(r['signal'])
-    conv   = _conviction_label(r['conviction'])
-    is_long = 'LONG' in r['signal']
-
-    entry  = r.get('entry', r.get('close', 0))
-    sl     = r.get('sl', 0)
-    tp     = r.get('tp', 0)
-    rr     = r.get('rr', 0)
-    rsi    = r.get('rsi', 50)
-    dist   = r.get('dist_pct', 0)
-    n_ex   = r.get('exchange_count', 1)
-    ex_badge = '🔵🔵🔵' if n_ex == 3 else ('🔵🔵⚪' if n_ex == 2 else '🔵⚪⚪')
-
-    fvg_tag = ''
-    if r.get('fvg_bullish') and is_long:
-        fvg_tag = ' 〔FVG Bullish〕'
-    elif r.get('fvg_bearish') and not is_long:
-        fvg_tag = ' 〔FVG Bearish〕'
-
-    reason = r.get('reason', '')
-
-    lines = [
-        f'{emoji} <b>{sym}</b>{fvg_tag}  {ex_badge}  {conv}',
-        f'   Entry : <code>{entry:.6g}</code>',
-        f'   SL    : <code>{sl:.6g}</code>  ({abs((sl-entry)/entry*100):.2f}%)',
-        f'   TP    : <code>{tp:.6g}</code>  ({abs((tp-entry)/entry*100):.2f}%)',
-        f'   RR    : 1:{rr:.2f}  |  RSI {rsi:.0f}  |  dist {dist:+.2f}%',
-    ]
-    if reason:
-        # Truncate reason to keep TG message clean
-        short_reason = reason if len(reason) < 200 else reason[:197] + '...'
-        lines.append(f'   📝 {short_reason}')
-
-    return '\n'.join(lines)
-
-
-# ── Full screener result message ──────────────────────────────────────────────
-def build_message(result: dict, top_n: int = 5) -> str:
-    ts    = result['timestamp'].strftime('%Y-%m-%d %H:%M UTC')
-    tf    = result['timeframe']
-    stats = result['stats']
-    longs  = result['longs'][:top_n]
-    shorts = result['shorts'][:top_n]
-    full3  = stats.get('full_3ex', 0)
-
-    lines = [
-        f'📊 <b>VWAP WEEKLY SCREENER</b>  •  {tf}  •  {ts}',
-        f'📡 <b>Bybit + OKX + Gate.io</b>  (averaged)',
-        f'🔍 Scanned: {stats["total_scanned"]}  |  '
-        f'{stats["long_count"]}L  {stats["short_count"]}S  |  '
-        f'3-ex: {full3}',
-        '',
-        '─── 🟢 LONG ───',
-    ]
-    if longs:
-        for r in longs:
-            lines.append(fmt_signal_card(r))
-            lines.append('')
-    else:
-        lines.append('  — no candidates —')
-        lines.append('')
-
-    lines.append('─── 🔴 SHORT ───')
-    if shorts:
-        for r in shorts:
-            lines.append(fmt_signal_card(r))
-            lines.append('')
-    else:
-        lines.append('  — no candidates —')
-        lines.append('')
-
-    lines += [
-        '─────────────────────────────',
-        '<i>🔥=bounce confirmed  🔵=exchange coverage</i>',
-        '<i>SL=ATR-based  TP=VWAP band  ⚠️Not financial advice</i>',
-    ]
-    return '\n'.join(lines)
-
-
-# ── Sender ────────────────────────────────────────────────────────────────────
-def send_message(chat_id: str, text: str) -> bool:
-    url = f'{TELEGRAM_API}/sendMessage'
-    payload = {
-        'chat_id'                 : chat_id,
-        'text'                    : text,
-        'parse_mode'              : 'HTML',
-        'disable_web_page_preview': True,
-    }
+# ── Low-level helpers ─────────────────────────────────────────────────────────
+def _api(token: str, method: str, payload: dict) -> dict:
+    url = TELEGRAM_API.format(token=token, method=method)
     try:
         r = requests.post(url, json=payload, timeout=10)
-        return r.json().get('ok', False)
+        return r.json()
     except Exception as e:
-        print(f'[telegram] send error: {e}')
+        print(f"[telegram] {method} error: {e}")
+        return {}
+
+
+def _send(token: str, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
+    res = _api(token, "sendMessage", {
+        "chat_id"   : chat_id,
+        "text"      : text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    })
+    return res.get("ok", False)
+
+
+def _get_token() -> str:
+    return os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+
+# ── Signal formatting ─────────────────────────────────────────────────────────
+def _fmt_price(p: float) -> str:
+    """Format price intelligently based on magnitude."""
+    if p >= 1000:
+        return f"{p:,.2f}"
+    elif p >= 1:
+        return f"{p:.4f}"
+    elif p >= 0.01:
+        return f"{p:.5f}"
+    else:
+        return f"{p:.8f}"
+
+
+def _fmt_signal(sig: dict) -> str:
+    """
+    Render a single signal as a Telegram message.
+
+    Example output:
+    ─────────────────────────────────
+    🟢🔥 LONG STRONG — BTC  •  15m
+    ─────────────────────────────────
+    📍 Entry   : 68,420.00
+    🛑 SL      : 67,900.00   (-0.76%)
+    🎯 TP1     : 68,940.00   (+0.76%)
+    🏆 TP2     : 69,460.00   (+1.52%)  ← min target RR 1:2
+
+    📊 RSI : 44.2   |   Dist VWAP : +0.18%
+    🔲 FVG : 68,100 – 68,350  (bullish)
+    📈 RR  : 1 : 2.00
+    ─────────────────────────────────
+    """
+    d    = sig["direction"]
+    sym  = sig["symbol"]
+    tf   = sig["timeframe"]
+    strong = sig.get("strong", False)
+    conv = sig.get("conviction", "")
+
+    entry = sig["entry"]
+    sl    = sig["sl"]
+    tp1   = sig["tp1"]
+    tp2   = sig["tp2"]
+    rr    = sig["rr"]
+    rsi   = sig["rsi"]
+    dist  = sig["dist_pct"]
+    fvg_b = sig["fvg_bot"]
+    fvg_t = sig["fvg_top"]
+    fvg_k = sig.get("fvg_type", "")
+
+    sl_pct  = (sl  - entry) / entry * 100
+    tp1_pct = (tp1 - entry) / entry * 100
+    tp2_pct = (tp2 - entry) / entry * 100
+
+    if d == "LONG":
+        icon = "🟢🔥" if strong else "🟢"
+        label = "LONG STRONG" if strong else "LONG"
+    else:
+        icon = "🔴🔥" if strong else "🔴"
+        label = "SHORT STRONG" if strong else "SHORT"
+
+    divider = "─" * 36
+    lines = [
+        divider,
+        f"{icon} <b>{label}</b>  —  <b>{sym}</b>  •  {tf}",
+        divider,
+        f"📍 Entry   :  <code>{_fmt_price(entry)}</code>",
+        f"🛑 SL      :  <code>{_fmt_price(sl)}</code>   ({sl_pct:+.2f}%)",
+        f"🎯 TP1     :  <code>{_fmt_price(tp1)}</code>   ({tp1_pct:+.2f}%)",
+        f"🏆 TP2     :  <code>{_fmt_price(tp2)}</code>   ({tp2_pct:+.2f}%)  ← RR 1:{rr:.1f}",
+        "",
+        f"📊 RSI : <b>{rsi}</b>   |   Dist VWAP : {dist:+.3f}%",
+        f"🔲 FVG : <code>{_fmt_price(fvg_b)}</code> – <code>{_fmt_price(fvg_t)}</code>  ({fvg_k})",
+        f"📈 RR  : 1 : {rr:.2f}   {conv}",
+        divider,
+    ]
+    return "\n".join(lines)
+
+
+def _fmt_summary(result: dict, top_n: int = 5) -> str:
+    """Render full screener run as Telegram message."""
+    tf       = result.get("timeframe", "?")
+    scanned  = result.get("scanned_at", "")
+    stats    = result.get("stats", {})
+    longs    = result["longs"][:top_n]
+    shorts   = result["shorts"][:top_n]
+
+    total_l = stats.get("long_count", 0)
+    total_s = stats.get("short_count", 0)
+
+    lines = [
+        f"📊 <b>VWAP WEEKLY SCREENER</b>  •  {tf}  •  {scanned}",
+        f"🔍 Scanned: {stats.get('total_scanned',0)} coins  |  "
+        f"Signals: {total_l}L  {total_s}S",
+        "",
+    ]
+
+    if longs:
+        lines.append("🟢 <b>LONG</b>  —  FVG bounce + above VWAP weekly mid")
+        lines.append(f"{'Symbol':<8}  {'RSI':>5}  {'Dist':>7}  {'RR':>5}  {'Conviction'}")
+        for s in longs:
+            flag = "🔥" if s["strong"] else "  "
+            lines.append(
+                f"🟢{flag} {s['symbol']:<7}  {s['rsi']:>5}  "
+                f"{s['dist_pct']:>+6.2f}%  {s['rr']:>4.1f}  {s['conviction']}"
+            )
+        lines.append("")
+
+    if shorts:
+        lines.append("🔴 <b>SHORT</b>  —  FVG rejection + below VWAP weekly mid")
+        lines.append(f"{'Symbol':<8}  {'RSI':>5}  {'Dist':>7}  {'RR':>5}  {'Conviction'}")
+        for s in shorts:
+            flag = "🔥" if s["strong"] else "  "
+            lines.append(
+                f"🔴{flag} {s['symbol']:<7}  {s['rsi']:>5}  "
+                f"{s['dist_pct']:>+6.2f}%  {s['rr']:>4.1f}  {s['conviction']}"
+            )
+        lines.append("")
+
+    if not longs and not shorts:
+        lines.append("⏳ Belum ada sinyal yang memenuhi kriteria FVG + RR 1:2.")
+        lines.append("Screener tetap jalan otomatis setiap candle 15m.")
+
+    return "\n".join(lines)
+
+
+# ── Public send functions ─────────────────────────────────────────────────────
+def send_signal(sig: dict, chat_id: str) -> bool:
+    """Send a single signal alert immediately."""
+    token = _get_token()
+    if not token or not chat_id:
         return False
+    text = _fmt_signal(sig)
+    ok = _send(token, chat_id, text)
+    if ok:
+        print(f"[telegram] ✅ Sent signal: {sig['direction']} {sig['symbol']}")
+    else:
+        print(f"[telegram] ❌ Failed signal: {sig['direction']} {sig['symbol']}")
+    return ok
 
 
-def send_result(result: dict, chat_id: str, top_n: int = 5) -> bool:
-    msg = build_message(result, top_n=top_n)
-    return send_message(chat_id, msg)
+def send_result(result: dict, chat_id: str, top_n: int = 5) -> None:
+    """Send screener summary + individual signal alerts."""
+    token = _get_token()
+    if not token or not chat_id:
+        return
+
+    all_sigs = result.get("longs", []) + result.get("shorts", [])
+
+    # Always send individual alerts first (1 per coin, max top_n)
+    sent = 0
+    for sig in all_sigs:
+        if sent >= top_n:
+            break
+        send_signal(sig, chat_id)
+        time.sleep(0.3)
+        sent += 1
+
+    # Then send the summary table
+    if all_sigs:
+        summary = _fmt_summary(result, top_n=top_n)
+        _send(token, chat_id, summary)
+    else:
+        # Even if no signals, send a brief status
+        msg = (
+            f"📭 <b>VWAP Screener</b>  •  {result.get('timeframe','?')}\n"
+            f"🕐 {result.get('scanned_at','')}\n"
+            f"🔍 Scanned {result.get('stats',{}).get('total_scanned',0)} coins\n"
+            f"⏳ Tidak ada setup FVG + RR 1:2 saat ini."
+        )
+        _send(token, chat_id, msg)
 
 
-# ── Bot ───────────────────────────────────────────────────────────────────────
+# ── Telegram Bot (polling) ───────────────────────────────────────────────────
 class TelegramBot:
-    def __init__(self, chat_id: str, on_run_cmd, on_status_cmd, on_summary_cmd):
-        self.chat_id         = chat_id
-        self.on_run_cmd      = on_run_cmd
-        self.on_status_cmd   = on_status_cmd
-        self.on_summary_cmd  = on_summary_cmd
-        self.offset          = 0
+    def __init__(
+        self,
+        chat_id: str,
+        on_run_cmd:     Callable,
+        on_status_cmd:  Callable,
+        on_summary_cmd: Callable,
+    ):
+        self.token    = _get_token()
+        self.chat_id  = chat_id
+        self.on_run   = on_run_cmd
+        self.on_status = on_status_cmd
+        self.on_summary = on_summary_cmd
+        self._offset   = 0
 
-    def _get_updates(self, timeout: int = 30) -> list:
-        url    = f'{TELEGRAM_API}/getUpdates'
-        params = {'offset': self.offset, 'timeout': timeout,
-                  'allowed_updates': ['message']}
-        try:
-            r = requests.get(url, params=params, timeout=timeout + 5)
-            return r.json().get('result', [])
-        except Exception as e:
-            print(f'[telegram] poll error: {e}')
-            return []
+    def _get_updates(self) -> list[dict]:
+        res = _api(self.token, "getUpdates", {
+            "offset": self._offset,
+            "timeout": 30,
+            "allowed_updates": ["message"],
+        })
+        return res.get("result", [])
 
-    def _send(self, text: str):
-        send_message(self.chat_id, text)
+    def _handle(self, update: dict) -> None:
+        msg  = update.get("message", {})
+        text = msg.get("text", "").strip()
+        cid  = str(msg.get("chat", {}).get("id", ""))
 
-    def _handle(self, message: dict):
-        chat_id = str(message.get('chat', {}).get('id', ''))
-        text    = message.get('text', '').strip()
-        user    = message.get('from', {}).get('username', '?')
-
-        if chat_id != self.chat_id:
-            return
-
-        if not text.startswith('/'):
+        if not text.startswith("/"):
             return
 
         parts = text.split()
-        cmd   = parts[0].lower().split('@')[0]
-        args  = parts[1:]
+        cmd   = parts[0].lower()
 
-        print(f'[bot] @{user} → {cmd} {args}')
+        if cmd == "/run":
+            tf = parts[1] if len(parts) > 1 else None
+            _send(self.token, cid, "⏳ Running screener...")
+            try:
+                result = self.on_run(tf)
+                send_result(result, cid)
+            except Exception as e:
+                _send(self.token, cid, f"❌ Error: {e}")
 
-        if cmd == '/help':
-            self._send(
-                '🤖 <b>VWAP Screener Commands</b>\n\n'
-                '/run           — screener 30m\n'
-                '/run 1h        — screener timeframe lain\n'
-                '/summary       — backtest 7 hari\n'
-                '/summary 30    — backtest 30 hari\n'
-                '/status        — info run terakhir\n'
-                '/help          — daftar perintah\n\n'
-                '<i>Sinyal include: Entry, SL (ATR-based), TP (VWAP band), RR, FVG, Reason</i>'
+        elif cmd == "/status":
+            _send(self.token, cid, self.on_status(), "HTML")
+
+        elif cmd in ("/summary",):
+            days = int(parts[1]) if len(parts) > 1 else 7
+            _send(self.token, cid, self.on_summary(days), "HTML")
+
+        elif cmd == "/help":
+            help_text = (
+                "📋 <b>VWAP Screener — Commands</b>\n\n"
+                "/run          — Jalankan screener sekarang (15m)\n"
+                "/run 1h       — Jalankan dengan timeframe lain\n"
+                "/status       — Info run terakhir + backtest 7 hari\n"
+                "/summary [N]  — Ringkasan N hari terakhir (default 7)\n"
+                "/help         — Daftar command\n\n"
+                "<b>Kriteria sinyal:</b>\n"
+                "• Close di atas/bawah VWAP Weekly mid\n"
+                "• Entry di zona FVG Bullish/Bearish\n"
+                "• Minimum RR 1:2\n"
+                "• Auto-alert setiap candle 15m"
             )
+            _send(self.token, cid, help_text, "HTML")
 
-        elif cmd == '/run':
-            valid_tf = {'1m','5m','15m','30m','1h','4h','1d'}
-            tf = args[0] if args and args[0] in valid_tf else '30m'
-            self._send(f'⏳ Running screener ({tf})...')
-            try:
-                result = self.on_run_cmd(tf)
-                send_result(result, self.chat_id)
-            except Exception as e:
-                self._send(f'❌ Error: {e}')
-
-        elif cmd == '/summary':
-            days = 7
-            if args:
-                try:
-                    days = int(args[0])
-                except ValueError:
-                    pass
-            self._send(f'📊 Generating backtest summary ({days} hari)...')
-            try:
-                msg = self.on_summary_cmd(days)
-                self._send(msg)
-            except Exception as e:
-                self._send(f'❌ Error: {e}')
-
-        elif cmd == '/status':
-            try:
-                self._send(self.on_status_cmd())
-            except Exception as e:
-                self._send(f'❌ Error: {e}')
-
-        else:
-            self._send(f'❓ Unknown: <code>{cmd}</code> — ketik /help')
-
-    def poll_once(self):
-        updates = self._get_updates(timeout=30)
-        for upd in updates:
-            self.offset = upd['update_id'] + 1
-            msg = upd.get('message')
-            if msg:
-                self._handle(msg)
-
-    def start_polling(self):
-        print('[bot] Telegram polling started')
+    def start_polling(self) -> None:
+        print("[bot] Polling started...")
         while True:
             try:
-                self.poll_once()
-                time.sleep(1)
-            except KeyboardInterrupt:
-                print('[bot] stopped')
-                break
+                updates = self._get_updates()
+                for u in updates:
+                    self._offset = u["update_id"] + 1
+                    self._handle(u)
             except Exception as e:
-                print(f'[bot] error: {e}')
+                print(f"[bot] Poll error: {e}")
                 time.sleep(5)
