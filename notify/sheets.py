@@ -239,47 +239,83 @@ def _fetch_price(symbol_short: str) -> Optional[float]:
     return _price_cache.get(symbol_short)   # return stale if fetch failed
 
 
-def _calc_pnl(direction: str, entry: float, current: float) -> str:
+def _calc_pnl(direction: str, entry: float, exit_price: float) -> str:
     if entry <= 0:
         return "–"
-    pct = (current - entry) / entry * 100
+    pct = (exit_price - entry) / entry * 100
     if direction == "SHORT":
         pct = -pct
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.2f}%"
 
 
-def _resolve_status(direction: str, entry: float, sl: float,
-                    tp1: float, tp2: float, current: float) -> str:
-    """Determine if signal hit TP2/TP1/SL or still OPEN."""
+def _resolve_live(direction: str, entry: float, sl: float,
+                  tp1: float, tp2: float, current: float) -> str:
+    """Quick check vs current price only (for very fresh signals)."""
     if direction == "LONG":
-        if current >= tp2:
-            return "TP2 ✅"
-        if current >= tp1:
-            return "TP1"
-        if current <= sl:
-            return "SL ❌"
-    else:  # SHORT
-        if current <= tp2:
-            return "TP2 ✅"
-        if current <= tp1:
-            return "TP1"
-        if current >= sl:
-            return "SL ❌"
+        if current >= tp2: return "TP2 ✅"
+        if current >= tp1: return "TP1"
+        if current <= sl:  return "SL ❌"
+    else:
+        if current <= tp2: return "TP2 ✅"
+        if current <= tp1: return "TP1"
+        if current >= sl:  return "SL ❌"
     return "OPEN"
+
+
+def _backtest_resolve(
+    symbol: str, direction: str, timeframe: str,
+    entry: float, sl: float, tp1: float, tp2: float,
+    signal_ts: datetime,
+) -> tuple[str, float]:
+    """
+    Replay candles from signal_ts to find which level was hit FIRST.
+    Checks wick high/low per candle — candle where SL and TP conflict,
+    SL wins (conservative). Returns (status, exit_price).
+    """
+    ex = _get_bybit()
+    since_ms = int(signal_ts.timestamp() * 1000)
+
+    raw = None
+    for sym in [f"{symbol}/USDT:USDT", f"{symbol}/USDT"]:
+        try:
+            raw = ex.fetch_ohlcv(sym, timeframe=timeframe, since=since_ms, limit=300)
+            if raw and len(raw) >= 2:
+                break
+        except Exception:
+            continue
+
+    if not raw or len(raw) < 2:
+        curr = _fetch_price(symbol) or entry
+        return _resolve_live(direction, entry, sl, tp1, tp2, curr), curr
+
+    # Skip first candle (entry candle itself)
+    for candle in raw[1:]:
+        _, _, high, low, close, _ = candle
+        if direction == "LONG":
+            if low <= sl:   return "SL ❌",  sl
+            if high >= tp2: return "TP2 ✅", tp2
+            if high >= tp1: return "TP1",    tp1
+        else:
+            if high >= sl:  return "SL ❌",  sl
+            if low <= tp2:  return "TP2 ✅", tp2
+            if low <= tp1:  return "TP1",    tp1
+
+    # No level hit yet → OPEN, return current price
+    curr = _fetch_price(symbol) or entry
+    return "OPEN", curr
 
 
 def price_updater_loop() -> None:
     """
-    Background thread: scan all OPEN rows and refresh
-    Current Price, PnL %, and Status columns.
+    Background thread: scan all OPEN/TP1 rows.
+    • Sinyal < 2 candle lama  → cek harga live
+    • Sinyal lebih lama       → replay candle historis (backtest)
     Runs every PRICE_REFRESH_SEC seconds.
     """
     if not _enabled:
         return
-
-    print(f"[sheets] Price updater running every {PRICE_REFRESH_SEC}s...")
-
+    print(f"[sheets] Price updater + backtest resolver running every {PRICE_REFRESH_SEC}s...")
     while True:
         try:
             _refresh_prices()
@@ -288,8 +324,13 @@ def price_updater_loop() -> None:
         time.sleep(PRICE_REFRESH_SEC)
 
 
+# Map timeframe string → candle duration in minutes
+_TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+               "1h": 60, "2h": 120, "4h": 240, "1d": 1440}
+
+
 def _refresh_prices() -> None:
-    """Read all rows, find OPEN ones, update price/PnL/status."""
+    """Read all OPEN/TP1 rows, resolve status via candle replay or live price."""
     if _ws is None:
         return
 
@@ -297,10 +338,9 @@ def _refresh_prices() -> None:
         all_rows = _ws.get_all_values()
 
     if len(all_rows) <= 1:
-        return   # only header
+        return
 
-    # Collect unique symbols from OPEN rows
-    open_rows: list[tuple[int, list]] = []   # (row_number_1based, row_data)
+    open_rows: list[tuple[int, list]] = []
     for i, row in enumerate(all_rows[1:], start=2):
         if len(row) < 17:
             continue
@@ -311,23 +351,14 @@ def _refresh_prices() -> None:
     if not open_rows:
         return
 
-    # Fetch prices (one per unique symbol)
-    symbols_needed = {row[COL["Symbol"] - 1] for _, row in open_rows}
-    prices = {}
-    for sym in symbols_needed:
-        p = _fetch_price(sym)
-        if p:
-            prices[sym] = p
-        time.sleep(0.1)
-
-    if not prices:
-        return
-
-    # Batch update
     updates: list[dict] = []
+    now_utc = datetime.now(timezone.utc)
+
     for row_num, row in open_rows:
         sym  = row[COL["Symbol"]    - 1]
         dirn = row[COL["Direction"] - 1]
+        tf   = row[COL["Timeframe"] - 1] or "15m"
+
         try:
             entry = float(row[COL["Entry"] - 1])
             sl    = float(row[COL["SL"]    - 1])
@@ -336,12 +367,31 @@ def _refresh_prices() -> None:
         except (ValueError, IndexError):
             continue
 
-        curr = prices.get(sym)
-        if curr is None:
-            continue
+        # Parse signal timestamp
+        try:
+            ts_str = row[COL["Timestamp (UTC)"] - 1]
+            signal_ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            signal_ts = now_utc
 
-        pnl    = _calc_pnl(dirn, entry, curr)
-        status = _resolve_status(dirn, entry, sl, tp1, tp2, curr)
+        # Decide: use historical replay or live price
+        tf_min  = _TF_MINUTES.get(tf, 15)
+        age_min = (now_utc - signal_ts).total_seconds() / 60
+
+        if age_min > tf_min * 2:
+            # Sinyal sudah lebih dari 2 candle lama → replay historis
+            status, exit_price = _backtest_resolve(
+                sym, dirn, tf, entry, sl, tp1, tp2, signal_ts
+            )
+        else:
+            # Sinyal masih fresh → cek harga live
+            curr = _fetch_price(sym) or entry
+            status    = _resolve_live(dirn, entry, sl, tp1, tp2, curr)
+            exit_price = curr
+
+        time.sleep(0.15)   # rate limit
+
+        pnl = _calc_pnl(dirn, entry, exit_price)
 
         price_col  = _col_letter(COL["Current Price"])
         pnl_col    = _col_letter(COL["PnL %"])
@@ -349,7 +399,7 @@ def _refresh_prices() -> None:
 
         updates.append({
             "range" : f"{price_col}{row_num}:{status_col}{row_num}",
-            "values": [[curr, pnl, status]],
+            "values": [[exit_price, pnl, status]],
         })
 
         # Re-color closed rows
@@ -368,7 +418,7 @@ def _refresh_prices() -> None:
         try:
             with _lock:
                 _ws.batch_update(updates, value_input_option="USER_ENTERED")
-            print(f"[sheets] Updated {len(updates)} rows.")
+            print(f"[sheets] Resolved {len(updates)} rows.")
         except Exception as e:
             print(f"[sheets] batch_update error: {e}")
 
