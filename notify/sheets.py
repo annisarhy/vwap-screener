@@ -865,10 +865,10 @@ def update_dashboard() -> None:
     high_n = medium_n = low_n = 0
     for r in rows:
         if len(r) <= conv_idx: continue
-        cv = str(r[conv_idx]).strip()
-        if cv == "High":   high_n   += 1
-        elif cv == "Medium": medium_n += 1
-        elif cv == "Low":    low_n    += 1
+        cv = str(r[conv_idx]).strip().lower()
+        if "high" in cv:   high_n   += 1
+        elif "medium" in cv: medium_n += 1
+        elif "low" in cv:    low_n    += 1
 
     # ── Win streak (most recent closed signals) ───────────────
     streak = 0; streak_type = ""
@@ -1087,9 +1087,10 @@ def update_dashboard() -> None:
         # ── Batch: widths + row heights + cleanup charts ───────────────
         sh = _gc.open_by_key(SHEET_ID); sid = dws.id
         reqs = []
-        # Column widths — A wide for label, D & K wide for values
-        for ci, px in [(0,170),(1,80),(2,65),(3,70),(4,30),(5,30),(6,30),
-                        (7,170),(8,80),(9,65),(10,70),(11,30),(12,30),(13,30)]:
+        # Column widths — A/H wide for labels, D/K for values, E-G/L-N narrow gaps
+        # For table section: use natural widths (cols 0-11 = A-L)
+        for ci, px in [(0,180),(1,80),(2,60),(3,45),(4,80),(5,80),
+                        (6,80),(7,180),(8,80),(9,60),(10,80),(11,45),(12,80),(13,80)]:
             reqs.append({"updateDimensionProperties": {
                 "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":ci,"endIndex":ci+1},
                 "properties": {"pixelSize":px}, "fields":"pixelSize"}})
