@@ -711,6 +711,10 @@ def has_open_position(symbol: str, direction: str) -> bool:
 DAILY_TAB = "Daily"
 _daily_ws  = None
 
+# ── Dashboard Tab ──────────────────────────────────────────────────────────────
+DASHBOARD_TAB = "Dashboard"
+_dash_ws = None
+
 
 def _get_daily_ws():
     global _daily_ws
@@ -1193,8 +1197,8 @@ def update_dashboard() -> None:
 
     # ── ROW 3-5: KPI cards ───────────────────────────────────────────
     pnl_str_v = f"{pnl_sign}{pnl_sum:.2f}%"
-    grid.append(row14("TOTAL SINYAL","","","WIN RATE","","","TOTAL PnL","","","AVG WIN","","","AVG LOSS",""))
-    grid.append(row14(total,"","",f"{win_rate:.1f}%","","",pnl_str_v,"","",f"+{avg_win:.2f}%","","",f"{avg_loss:.2f}%",""))
+    grid.append(row14("TOTAL SINYAL","","","WIN RATE","","","TOTAL PnL","","","AVG WIN","","AVG LOSS","",""))
+    grid.append(row14(total,"","",f"{win_rate:.1f}%","","",pnl_str_v,"","",f"+{avg_win:.2f}%","",f"{avg_loss:.2f}%","",""))
     grid.append(row14(f"{open_n} open · {closed} closed","","",f"{wins}W / {sl_n}L","","","closed trades","","","","","","",""))
     grid.append(empty14[:])  # ROW 6
 
@@ -1265,7 +1269,7 @@ def update_dashboard() -> None:
         pnl_c = _rgb(46,139,87) if pnl_sum>=0 else _rgb(180,50,50)
         _fmt(dws, "G4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": pnl_c}})
         _fmt(dws, "J4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": _rgb(46,139,87)}})
-        _fmt(dws, "M4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": _rgb(180,50,50)}})
+        _fmt(dws, "L4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": _rgb(180,50,50)}})
 
         # ROW 5: KPI sub
         _fmt(dws, "A5:N5", {"textFormat": {"fontSize":9,"foregroundColor":{"red":0.5,"green":0.5,"blue":0.6}},
@@ -1350,10 +1354,9 @@ def update_dashboard() -> None:
         # ── Batch: widths + row heights + cleanup charts ───────────────
         sh = _gc.open_by_key(SHEET_ID); sid = dws.id
         reqs = []
-        # Column widths — A/H wide for labels, D/K for values, E-G/L-N narrow gaps
-        # For table section: use natural widths (cols 0-11 = A-L)
-        for ci, px in [(0,180),(1,80),(2,60),(3,45),(4,80),(5,80),
-                        (6,80),(7,180),(8,80),(9,60),(10,80),(11,45),(12,80),(13,80)]:
+        # Column widths — designed to fit the 12-column table at the bottom cleanly
+        for ci, px in [(0,105),(1,70),(2,60),(3,45),(4,75),(5,75),
+                        (6,75),(7,45),(8,75),(9,75),(10,75),(11,90),(12,40),(13,40)]:
             reqs.append({"updateDimensionProperties": {
                 "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":ci,"endIndex":ci+1},
                 "properties": {"pixelSize":px}, "fields":"pixelSize"}})
