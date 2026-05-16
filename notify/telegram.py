@@ -96,6 +96,7 @@ def _fmt_signal(sig: dict) -> str:
     sl    = sig["sl"]
     tp1   = sig["tp1"]
     tp2   = sig["tp2"]
+    tp3   = sig.get("tp3", 0)
     rr    = sig["rr"]
     rsi   = sig["rsi"]
     dist  = sig["dist_pct"]
@@ -114,6 +115,7 @@ def _fmt_signal(sig: dict) -> str:
     sl_pct  = (sl  - entry) / entry * 100
     tp1_pct = (tp1 - entry) / entry * 100
     tp2_pct = (tp2 - entry) / entry * 100
+    tp3_pct = (tp3 - entry) / entry * 100 if tp3 else 0
 
     if d == "LONG":
         icon = "🟢🔥" if strong else "🟢"
@@ -133,6 +135,10 @@ def _fmt_signal(sig: dict) -> str:
         f"🛑 SL      :  <code>{_fmt_price(sl)}</code>   ({sl_pct:+.2f}%)  {sl_label}",
         f"🎯 TP1     :  <code>{_fmt_price(tp1)}</code>   ({tp1_pct:+.2f}%)",
         f"🏆 TP2     :  <code>{_fmt_price(tp2)}</code>   ({tp2_pct:+.2f}%)  ← RR 1:{rr:.1f}",
+    ]
+    if tp3:
+        lines.append(f"🚀 TP3     :  <code>{_fmt_price(tp3)}</code>   ({tp3_pct:+.2f}%)  ← extended")
+    lines += [
         "",
         f"📊 RSI : <b>{rsi}</b>   |   Dist VWAP : {dist:+.3f}%",
         f"🔲 FVG : <code>{_fmt_price(fvg_b)}</code> – <code>{_fmt_price(fvg_t)}</code>  ({fvg_k})",
@@ -152,7 +158,7 @@ def _fmt_signal(sig: dict) -> str:
     lines.append(f"🕐 HTF   : {htf_icon} {'Aligned' if htf_aligned else 'Berlawanan'}")
 
     lines.append("")
-    lines.append("💡 <i>Exit: Trailing Stop aktif setelah TP1</i>")
+    lines.append("💡 <i>Exit: TP1→trail(50%) → TP2→trail(30%) → TP3</i>")
     lines.append(divider)
 
     return "\n".join(lines)

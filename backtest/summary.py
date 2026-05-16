@@ -33,6 +33,7 @@ def build_summary_message(days: int = 7) -> str:
     closed   = stats["tp"] + stats["sl"]
     tp_rate  = stats["tp"] / closed * 100 if closed > 0 else 0
     sl_rate  = stats["sl"] / closed * 100 if closed > 0 else 0
+    tp3_rate = stats.get("tp3", 0) / closed * 100 if closed > 0 else 0
     tp2_rate = stats["tp2"] / closed * 100 if closed > 0 else 0
     tp1_rate = stats["tp1"] / closed * 100 if closed > 0 else 0
     tsl_rate = stats.get("tsl", 0) / closed * 100 if closed > 0 else 0
@@ -51,10 +52,11 @@ def build_summary_message(days: int = 7) -> str:
         divider,
         f"Total sinyal : {stats['total']}",
         f"Closed       : {closed}  (OPEN: {stats['open']})",
-        f"TP2 ✅        : {stats['tp2']}  ({tp2_rate:.1f}%)",
-        f"TP1          : {stats['tp1']}  ({tp1_rate:.1f}%)",
-        f"TSL ✅        : {stats.get('tsl', 0)}  ({tsl_rate:.1f}%)  💡 trailing",
-        f"SL  ❌        : {stats['sl']}  ({sl_rate:.1f}%)",
+        f"🚀 TP3 ✅     : {stats.get('tp3', 0)}  ({tp3_rate:.1f}%)  ← extended",
+        f"🏆 TP2        : {stats['tp2']}  ({tp2_rate:.1f}%)",
+        f"🎯 TP1        : {stats['tp1']}  ({tp1_rate:.1f}%)",
+        f"💡 TSL ✅      : {stats.get('tsl', 0)}  ({tsl_rate:.1f}%)  trailing",
+        f"🛑 SL  ❌      : {stats['sl']}  ({sl_rate:.1f}%)",
         "",
         f"{win_emoji} Win rate  : <b>{stats['win_rate']:.1f}%</b>",
         f"💰 PnL total : <b>{pnl_sign}{stats['total_pnl']:.2f}%</b>",

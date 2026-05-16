@@ -341,6 +341,7 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
 
             tp1 = entry + risk          # 1:1
             tp2 = entry + 2 * risk      # 1:2
+            tp3 = entry + 3 * risk      # 1:3 (extended target)
 
             rr  = (tp2 - entry) / risk
 
@@ -365,6 +366,7 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
                 "sl"            : round(sl, 6),
                 "tp1"           : round(tp1, 6),
                 "tp2"           : round(tp2, 6),
+                "tp3"           : round(tp3, 6),
                 "rr"            : round(rr, 2),
                 "rsi"           : round(rsi, 1),
                 "vwap"          : round(vwap, 6),
@@ -414,6 +416,7 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
 
             tp1 = entry - risk
             tp2 = entry - 2 * risk
+            tp3 = entry - 3 * risk      # 1:3 (extended target)
 
             rr  = (entry - tp2) / risk
 
@@ -438,6 +441,7 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
                 "sl"            : round(sl, 6),
                 "tp1"           : round(tp1, 6),
                 "tp2"           : round(tp2, 6),
+                "tp3"           : round(tp3, 6),
                 "rr"            : round(rr, 2),
                 "rsi"           : round(rsi, 1),
                 "vwap"          : round(vwap, 6),

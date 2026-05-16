@@ -34,7 +34,7 @@ def compute_stats(days: int = 7) -> dict:
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-        tp1_n = tp2_n = sl_n = open_n = tsl_n = 0
+        tp1_n = tp2_n = tp3_n = sl_n = open_n = tsl_n = 0
         pnl_total = 0.0
 
         for row in rows:
@@ -58,7 +58,10 @@ def compute_stats(days: int = 7) -> dict:
             except ValueError:
                 pnl_val = 0.0
 
-            if "TP2" in status:
+            if "TP3" in status:
+                tp3_n    += 1
+                pnl_total += pnl_val
+            elif "TP2" in status and "🔒" not in status:
                 tp2_n    += 1
                 pnl_total += pnl_val
             elif "TSL" in status:
@@ -73,16 +76,17 @@ def compute_stats(days: int = 7) -> dict:
             else:
                 open_n += 1
 
-        closed  = tp2_n + tp1_n + tsl_n + sl_n
-        wins    = tp2_n + tp1_n + tsl_n
+        closed  = tp3_n + tp2_n + tp1_n + tsl_n + sl_n
+        wins    = tp3_n + tp2_n + tp1_n + tsl_n
         win_rate = wins / closed * 100 if closed > 0 else 0.0
 
         return {
             "win_rate" : win_rate,
             "total_pnl": pnl_total,
-            "tp"       : tp2_n + tp1_n + tsl_n,   # all wins
+            "tp"       : tp3_n + tp2_n + tp1_n + tsl_n,   # all wins
             "tp1"      : tp1_n,
             "tp2"      : tp2_n,
+            "tp3"      : tp3_n,
             "tsl"      : tsl_n,
             "sl"       : sl_n,
             "open"     : open_n,
