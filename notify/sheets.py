@@ -805,16 +805,17 @@ def update_dashboard() -> None:
 
     # ── Hitung stats ──────────────────────────────────────────────────
     total = len(rows)
-    open_n = tp1_n = tp2_n = sl_n = 0
+    stat_idx = COL["Status"] - 1
+    open_n = tp1_n = tp2_n = tp3_n = tsl_n = sl_n = 0
     pnl_sum = pnl_tp = pnl_sl = 0.0
-    long_tp2 = long_tp1 = long_sl = 0;  long_pnl = 0.0
-    short_tp2 = short_tp1 = short_sl = 0; short_pnl = 0.0
+    long_tp3 = long_tp2 = long_tp1 = long_tsl = long_sl = 0;  long_pnl = 0.0
+    short_tp3 = short_tp2 = short_tp1 = short_tsl = short_sl = 0; short_pnl = 0.0
     pnl_history = []
 
     for r in rows:
-        if len(r) < 17:
+        if len(r) <= stat_idx:
             continue
-        status = r[COL["Status"] - 1]
+        status = r[stat_idx]
         dirn   = r[COL["Direction"] - 1].upper()
         raw_p  = r[COL["PnL %"] - 1].replace("%","").replace("+","").strip()
         try:
@@ -822,31 +823,42 @@ def update_dashboard() -> None:
         except ValueError:
             pv = 0.0
 
-        if "TP2" in status:
+        if "TP3" in status:
+            tp3_n += 1; pnl_sum += pv; pnl_tp += pv; pnl_history.append(pv)
+            if dirn == "LONG":  long_tp3  += 1; long_pnl  += pv
+            else:               short_tp3 += 1; short_pnl += pv
+        elif "TP2" in status and "🔒" not in status:
             tp2_n += 1; pnl_sum += pv; pnl_tp += pv; pnl_history.append(pv)
             if dirn == "LONG":  long_tp2  += 1; long_pnl  += pv
             else:               short_tp2 += 1; short_pnl += pv
-        elif status == "TP1":
+        elif "TSL" in status:
+            tsl_n += 1; pnl_sum += pv; pnl_tp += pv; pnl_history.append(pv)
+            if dirn == "LONG":  long_tsl  += 1; long_pnl  += pv
+            else:               short_tsl += 1; short_pnl += pv
+        elif status in ("TP1", "TP1 🔒"):
             tp1_n += 1; pnl_sum += pv; pnl_tp += pv; pnl_history.append(pv)
             if dirn == "LONG":  long_tp1  += 1; long_pnl  += pv
             else:               short_tp1 += 1; short_pnl += pv
-        elif "SL" in status:
+        elif "SL" in status and "TSL" not in status:
             sl_n  += 1; pnl_sum += pv; pnl_sl  += pv; pnl_history.append(pv)
             if dirn == "LONG":  long_sl   += 1; long_pnl  += pv
             else:               short_sl  += 1; short_pnl += pv
         else:
             open_n += 1
 
-    closed   = tp2_n + tp1_n + sl_n
-    win_rate = (tp2_n + tp1_n) / closed * 100 if closed > 0 else 0.0
-    avg_win  = pnl_tp / (tp2_n + tp1_n)  if (tp2_n + tp1_n) > 0 else 0.0
-    avg_loss = pnl_sl / sl_n              if sl_n > 0          else 0.0
+    wins     = tp3_n + tp2_n + tp1_n + tsl_n
+    closed   = wins + sl_n
+    win_rate = wins / closed * 100 if closed > 0 else 0.0
+    avg_win  = pnl_tp / wins  if wins > 0  else 0.0
+    avg_loss = pnl_sl / sl_n  if sl_n > 0  else 0.0
     pnl_sign = "+" if pnl_sum >= 0 else ""
 
-    l_closed = long_tp2 + long_tp1 + long_sl
-    s_closed = short_tp2 + short_tp1 + short_sl
-    l_wr = (long_tp2 + long_tp1) / l_closed * 100  if l_closed > 0 else 0.0
-    s_wr = (short_tp2 + short_tp1) / s_closed * 100 if s_closed > 0 else 0.0
+    l_wins   = long_tp3 + long_tp2 + long_tp1 + long_tsl
+    s_wins   = short_tp3 + short_tp2 + short_tp1 + short_tsl
+    l_closed = l_wins + long_sl
+    s_closed = s_wins + short_sl
+    l_wr = l_wins / l_closed * 100  if l_closed > 0 else 0.0
+    s_wr = s_wins / s_closed * 100 if s_closed > 0 else 0.0
 
     wr_bar   = _spark_bar(win_rate, 100, 20)
     l_wr_bar = _spark_bar(l_wr, 100, 14)
@@ -896,7 +908,7 @@ def update_dashboard() -> None:
     grid.append(row14(total,"","",f"{win_rate:.1f}%","","",pnl_str,"","",f"+{avg_win:.2f}%","","",f"{avg_loss:.2f}%",""))
 
     # ROW 5: KPI sub
-    grid.append(row14(f"{open_n} open  |  {closed} closed","","",f"{tp2_n} TP2  ·  {tp1_n} TP1  ·  {sl_n} SL","","","closed trades","","","per trade menang","","","per trade kalah",""))
+    grid.append(row14(f"{open_n} open  |  {closed} closed","","",f"{tp3_n} TP3 · {tp2_n} TP2 · {tsl_n} TSL · {tp1_n} TP1 · {sl_n} SL","","","closed trades","","","per trade menang","","","per trade kalah",""))
 
     grid.append(empty14[:])
 
@@ -907,20 +919,22 @@ def update_dashboard() -> None:
     grid.append(row14(f"Win Rate  {l_wr:.1f}%","","","","","","",f"Win Rate  {s_wr:.1f}%","","","","","",""))
     grid.append(row14(l_wr_bar,"","","","","","",s_wr_bar,"","","","","",""))
 
-    # ROW 10-13: Stats rows
+    # ROW 10-14: Stats rows
     for label, lv, sv in [
-        ("TP2 ✅",    long_tp2,  short_tp2),
-        ("TP1",       long_tp1,  short_tp1),
-        ("SL ❌",      long_sl,   short_sl),
+        ("🚀 TP3 ✅",   long_tp3,   short_tp3),
+        ("🏆 TP2",      long_tp2,   short_tp2),
+        ("💡 TSL ✅",    long_tsl,   short_tsl),
+        ("🎯 TP1",      long_tp1,   short_tp1),
+        ("🛑 SL ❌",     long_sl,    short_sl),
         ("Net PnL",   f"{'+'if long_pnl>=0 else''}{long_pnl:.2f}%", f"{'+'if short_pnl>=0 else''}{short_pnl:.2f}%"),
     ]:
         grid.append(row14(label, lv, "", "", "", "", "", label, sv, "", "", "", "", ""))
 
     grid.append(empty14[:])
 
-    # ROW 15-16: Overall win rate bar
+    # ROW 17-18: Overall win rate bar
     grid.append(row14("📈  OVERALL WIN RATE","","","","","","","","","","","","",""))
-    grid.append(row14(f"{win_rate:.1f}%  {wr_bar}  ({tp2_n+tp1_n} win / {sl_n} loss dari {closed} closed)","","","","","","","","","","","","",""))
+    grid.append(row14(f"{win_rate:.1f}%  {wr_bar}  ({wins} win / {sl_n} loss dari {closed} closed)","","","","","","","","","","","","",""))
 
     grid.append(empty14[:])
 
@@ -995,14 +1009,14 @@ def update_dashboard() -> None:
         _fmt(dws, "H9:N9", {"textFormat": {"fontFamily": "Courier New", "fontSize": 10,
                               "foregroundColor": _rgb(160,40,40)}})
 
-        # Win rate overall bar (row 16)
-        _fmt(dws, "A16:N16", {
+        # Win rate overall bar (row 18 now)
+        _fmt(dws, "A18:N18", {
             "backgroundColor": _rgb(245, 248, 255),
             "textFormat": {"fontFamily": "Courier New", "fontSize": 11, "bold": True},
         })
 
-        # Table header (row 18)
-        table_row = 18
+        # Table header (dynamic — grid knows)
+        table_row = len(grid) - len(recent_grid)
         _fmt(dws, f"A{table_row}:N{table_row}", {
             "backgroundColor": _rgb(50, 65, 90),
             "textFormat": {"bold": True, "fontSize": 10,
@@ -1014,11 +1028,15 @@ def update_dashboard() -> None:
         for i, r in enumerate(recent_grid):
             row_num = table_row + 1 + i
             stat = r[11] if len(r) > 11 else ""
-            if "TP2" in stat:
+            if "TP3" in stat:
+                bg = _rgb(200, 245, 210)     # bright green
+            elif "TSL" in stat:
+                bg = _rgb(210, 240, 230)     # teal
+            elif "TP2" in stat:
                 bg = _rgb(230, 248, 234)
-            elif stat == "TP1":
+            elif "TP1" in stat:
                 bg = _rgb(225, 240, 255)
-            elif "SL" in stat:
+            elif "SL" in stat and "TSL" not in stat:
                 bg = _rgb(255, 232, 230)
             else:
                 bg = _rgb(250, 250, 252)
