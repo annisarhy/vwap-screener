@@ -540,8 +540,9 @@ def _update_live_prices() -> None:
         except Exception:
             pass
 
-    # Refresh dashboard setiap live update
+    # Refresh dashboard + daily tab setiap live update
     update_dashboard()
+    update_daily_pnl()
 
 
 def _backtest_resolve_loop() -> None:
@@ -637,6 +638,7 @@ def _run_backtest_resolver() -> None:
         except Exception:
             pass
     update_dashboard()
+    update_daily_pnl()
     # Refresh dashboard setelah resolver update
 
 
@@ -705,9 +707,246 @@ def has_open_position(symbol: str, direction: str) -> bool:
 
 
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
-DASHBOARD_TAB = "Dashboard"
-_dash_ws = None
+# ── Daily PnL Tab ──────────────────────────────────────────────────────────────
+DAILY_TAB = "Daily"
+_daily_ws  = None
+
+
+def _get_daily_ws():
+    global _daily_ws
+    if _daily_ws is not None:
+        return _daily_ws
+    try:
+        sh = _gc.open_by_key(SHEET_ID)
+        try:
+            _daily_ws = sh.worksheet(DAILY_TAB)
+        except gspread.WorksheetNotFound:
+            _daily_ws = sh.add_worksheet(title=DAILY_TAB, rows=100, cols=16)
+        return _daily_ws
+    except Exception as e:
+        print(f"[daily] init error: {e}")
+        return None
+
+
+def update_daily_pnl() -> None:
+    """
+    Writes a 'Daily PnL' worksheet with:
+      - Row 1 : Header bar
+      - Row 2 : Date filter input (B2) + computed stats for that date (C2-L2)
+      - Row 4 : Column headers for daily table
+      - Row 5+: One row per calendar day (newest first, last 60 days)
+    """
+    if not _enabled or _ws is None:
+        return
+    dws = _get_daily_ws()
+    if dws is None:
+        return
+
+    try:
+        with _lock:
+            rows = _ws.get_all_values()[1:]
+    except Exception as e:
+        print(f"[daily] read error: {e}")
+        return
+
+    ts_idx   = COL["Timestamp (UTC)"] - 1
+    dir_idx  = COL["Direction"] - 1
+    stat_idx = COL["Status"] - 1
+    pnl_idx  = COL["PnL %"] - 1
+    sym_idx  = COL["Symbol"] - 1
+
+    # ── Aggregate per date ─────────────────────────────────────────
+    from collections import defaultdict
+    daily: dict = defaultdict(lambda: {
+        "total":0,"wins":0,"losses":0,"open":0,
+        "pnl":0.0,"best":0.0,"worst":0.0,
+        "best_sym":"","worst_sym":"",
+        "long_w":0,"long_l":0,"short_w":0,"short_l":0,
+    })
+
+    for r in rows:
+        if len(r) <= max(ts_idx, stat_idx, pnl_idx): continue
+        ts_raw = r[ts_idx].strip()
+        if not ts_raw: continue
+        date_key = ts_raw[:10]   # "YYYY-MM-DD"
+        status   = r[stat_idx].strip()
+        dirn     = r[dir_idx].strip().upper() if len(r) > dir_idx else ""
+        sym      = r[sym_idx].strip() if len(r) > sym_idx else ""
+        raw_p    = r[pnl_idx].replace("%","").replace("+","").strip() if len(r) > pnl_idx else ""
+        try:
+            pv = float(raw_p.replace(",",".")) if raw_p and raw_p != "–" else 0.0
+        except ValueError:
+            pv = 0.0
+
+        d = daily[date_key]
+        d["total"] += 1
+
+        is_win  = ("TP" in status and "🔒" not in status) or "TSL" in status
+        is_loss = "SL" in status and "TSL" not in status
+
+        if is_win:
+            d["wins"] += 1; d["pnl"] += pv
+            if dirn == "LONG":  d["long_w"]  += 1
+            else:               d["short_w"] += 1
+            if pv > d["best"]:
+                d["best"] = pv; d["best_sym"] = sym
+        elif is_loss:
+            d["losses"] += 1; d["pnl"] += pv
+            if dirn == "LONG":  d["long_l"]  += 1
+            else:               d["short_l"] += 1
+            if pv < d["worst"]:
+                d["worst"] = pv; d["worst_sym"] = sym
+        else:
+            d["open"] += 1
+
+    # Sort dates newest-first, limit 60 days
+    sorted_dates = sorted(daily.keys(), reverse=True)[:60]
+
+    # ── Read user filter date from B2 ─────────────────────────────
+    try:
+        filter_date = dws.acell("B2").value or ""
+        filter_date = filter_date.strip()
+    except Exception:
+        filter_date = ""
+
+    # ── Build header info for filtered date ───────────────────────
+    def _day_stats_row(date_key):
+        d = daily.get(date_key)
+        if not d or d["total"] == 0:
+            return ["—"] * 10
+        closed = d["wins"] + d["losses"]
+        wr     = d["wins"] / closed * 100 if closed > 0 else 0.0
+        pnl_s  = f"{'+'if d['pnl']>=0 else''}{d['pnl']:.2f}%"
+        best_s = f"+{d['best']:.2f}% ({d['best_sym']})" if d["best_sym"] else "—"
+        worst_s= f"{d['worst']:.2f}% ({d['worst_sym']})" if d["worst_sym"] else "—"
+        return [
+            d["total"], closed, d["wins"], d["losses"],
+            f"{wr:.1f}%", pnl_s,
+            f"L {d['long_w']}W/{d['long_l']}L",
+            f"S {d['short_w']}W/{d['short_l']}L",
+            best_s, worst_s,
+        ]
+
+    fd_stats = _day_stats_row(filter_date) if filter_date else ["(ketik tanggal di B2)"] + [""] * 9
+
+    # ── Build grid ────────────────────────────────────────────────
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    empty16 = [""] * 16
+
+    def row16(*vals):
+        r = list(vals); r += [""] * (16 - len(r)); return r[:16]
+
+    grid = []
+    # ROW 1: Header
+    grid.append(row16("📅  DAILY PnL REVIEW","","","","","","","","","","","","","",f"🕐 {now_str}",""))
+    # ROW 2: Filter row
+    grid.append(row16("🔍 Filter Tanggal:", filter_date if filter_date else "YYYY-MM-DD",
+        fd_stats[0], fd_stats[1], fd_stats[2], fd_stats[3],
+        fd_stats[4], fd_stats[5], fd_stats[6], fd_stats[7],
+        fd_stats[8], fd_stats[9], "", "", "", ""))
+    # ROW 3: Filter labels
+    grid.append(row16("", "Tanggal (edit B2)", "Total", "Closed", "Wins", "Losses",
+        "Win Rate", "Net PnL", "LONG W/L", "SHORT W/L", "Best Trade", "Worst Trade",
+        "", "", "", ""))
+    # ROW 4: Spacer
+    grid.append(empty16[:])
+    # ROW 5: Table header
+    grid.append(row16("Tanggal","Total","Closed","W","L","Win Rate","Net PnL",
+        "LONG","SHORT","Best Trade","Worst Trade","","","","",""))
+
+    # ROW 6+: Daily rows
+    for dk in sorted_dates:
+        d = daily[dk]
+        closed  = d["wins"] + d["losses"]
+        wr      = d["wins"] / closed * 100 if closed > 0 else 0.0
+        pnl_s   = f"{'+'if d['pnl']>=0 else''}{d['pnl']:.2f}%"
+        best_s  = f"+{d['best']:.2f}% {d['best_sym']}" if d["best_sym"] else "—"
+        worst_s = f"{d['worst']:.2f}% {d['worst_sym']}" if d["worst_sym"] else "—"
+        grid.append(row16(
+            dk, d["total"], closed, d["wins"], d["losses"],
+            f"{wr:.1f}%", pnl_s,
+            f"{d['long_w']}W/{d['long_l']}L",
+            f"{d['short_w']}W/{d['short_l']}L",
+            best_s, worst_s,
+            "", "", "", "", ""
+        ))
+
+    # ── Write ─────────────────────────────────────────────────────
+    try:
+        # Only clear rows 1, 2, 3 and 5 onwards (preserve B2 user input area)
+        dws.batch_clear(["A1:P1", "C2:P2", "A3:P3", "A4:P4", f"A5:P{4+len(sorted_dates)+1}"])
+        dws.update(f"A1:P{len(grid)}", grid, value_input_option="RAW")
+        time.sleep(0.3)
+
+        # ── Formatting ────────────────────────────────────────────
+        # Row 1: Header bar
+        _fmt(dws, "A1:P1", {"backgroundColor": _rgb(30,40,58),
+            "textFormat": {"bold":True,"fontSize":13,"foregroundColor":{"red":1,"green":1,"blue":1}}})
+
+        # Row 2: Filter row — highlight filter date cell B2
+        _fmt(dws, "A2", {"textFormat": {"bold":True,"fontSize":10,"foregroundColor": _rgb(60,70,100)}})
+        _fmt(dws, "B2", {"backgroundColor": _rgb(255,252,220),
+            "textFormat": {"bold":True,"fontSize":11,"foregroundColor": _rgb(180,100,0)},
+            "horizontalAlignment": "CENTER"})
+        # Filter stats cells C2-L2
+        _fmt(dws, "C2:L2", {"textFormat": {"bold":True,"fontSize":10},
+            "horizontalAlignment": "CENTER"})
+
+        # Row 3: Filter labels
+        _fmt(dws, "A3:L3", {"backgroundColor": _rgb(240,242,246),
+            "textFormat": {"bold":False,"fontSize":8,"foregroundColor":{"red":0.5,"green":0.5,"blue":0.6}},
+            "horizontalAlignment": "CENTER"})
+
+        # Row 5: Table header
+        _fmt(dws, "A5:K5", {"backgroundColor": _rgb(50,65,90),
+            "textFormat": {"bold":True,"fontSize":10,"foregroundColor":{"red":1,"green":1,"blue":1}},
+            "horizontalAlignment": "CENTER"})
+
+        # Data rows — alternate shading + color PnL
+        sh  = _gc.open_by_key(SHEET_ID); sid = dws.id
+        reqs = []
+        for i, dk in enumerate(sorted_dates):
+            rn = 6 + i
+            d  = daily[dk]
+            pnl_positive = d["pnl"] >= 0
+            # Highlight today / filter date
+            if dk == filter_date:
+                bg = _rgb(255,248,200)
+            elif i % 2 == 0:
+                bg = _rgb(252,252,255)
+            else:
+                bg = _rgb(245,246,250)
+            _fmt(dws, f"A{rn}:K{rn}", {"backgroundColor": bg, "textFormat": {"fontSize":10}})
+            # Date col bold
+            _fmt(dws, f"A{rn}", {"textFormat": {"bold":True,"fontSize":10}})
+            # PnL col colored
+            _fmt(dws, f"G{rn}", {"textFormat": {"bold":True,"fontSize":10,"foregroundColor":
+                _rgb(30,130,60) if pnl_positive else _rgb(180,50,50)}})
+            # Win rate col colored
+            closed = d["wins"] + d["losses"]
+            wr_val = d["wins"] / closed * 100 if closed > 0 else 0.0
+            _fmt(dws, f"F{rn}", {"textFormat": {"foregroundColor":
+                _rgb(46,139,87) if wr_val >= 50 else _rgb(180,50,50)}})
+
+        # Column widths
+        for ci, px in [(0,105),(1,55),(2,55),(3,40),(4,40),(5,70),(6,90),
+                        (7,90),(8,90),(9,140),(10,140)]:
+            reqs.append({"updateDimensionProperties": {
+                "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":ci,"endIndex":ci+1},
+                "properties": {"pixelSize":px}, "fields":"pixelSize"}})
+        # Row heights
+        reqs.append({"updateDimensionProperties": {
+            "range":{"sheetId":sid,"dimension":"ROWS","startIndex":0,"endIndex":1},
+            "properties":{"pixelSize":40},"fields":"pixelSize"}})
+        reqs.append({"updateDimensionProperties": {
+            "range":{"sheetId":sid,"dimension":"ROWS","startIndex":1,"endIndex":2},
+            "properties":{"pixelSize":36},"fields":"pixelSize"}})
+
+        if reqs: sh.batch_update({"requests": reqs})
+        dws.freeze(rows=1, cols=1)
+        print(f"[daily] ✅ Updated — {len(sorted_dates)} days")
+    except Exception as e:
+        print(f"[daily] write error: {e}")
 
 
 def _get_dash_ws():
