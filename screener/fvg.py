@@ -11,6 +11,8 @@ Bearish FVG  : candle[i-2].low   >  candle[i].high
 
 Returns the most recent unmitigated FVG of each type.
 A FVG is "mitigated" when price trades through the gap's midpoint.
+
+Enhanced: Now stores trigger candle data for Dynamic SL calculation.
 """
 
 from dataclasses import dataclass
@@ -26,6 +28,9 @@ class FVG:
     mid: float          # midpoint of gap
     idx: int            # candle index where FVG formed (candle[i])
     timestamp: pd.Timestamp
+    # Trigger candle data for Dynamic SL
+    trigger_high: float = 0.0   # high of the FVG trigger candle (candle[i-1])
+    trigger_low: float  = 0.0   # low of the FVG trigger candle (candle[i-1])
 
 
 def detect_fvgs(df: pd.DataFrame, lookback: int = 50) -> list[FVG]:
@@ -47,6 +52,10 @@ def detect_fvgs(df: pd.DataFrame, lookback: int = 50) -> list[FVG]:
         curr_low   = sub.loc[i, "low"]
         curr_high  = sub.loc[i, "high"]
 
+        # Trigger candle = candle[i-1] (the middle candle of the 3-candle pattern)
+        trigger_high = sub.loc[i - 1, "high"]
+        trigger_low  = sub.loc[i - 1, "low"]
+
         ts = sub.loc[i, "timestamp"] if "timestamp" in sub.columns else sub.index[i]
 
         # ── Bullish FVG ───────────────────────────────────────────────
@@ -58,7 +67,11 @@ def detect_fvgs(df: pd.DataFrame, lookback: int = 50) -> list[FVG]:
             # Check if gap has been mitigated by subsequent candles
             mitigated = _is_mitigated_bull(sub, i, mid)
             if not mitigated:
-                fvgs.append(FVG("bullish", top=top, bottom=bottom, mid=mid, idx=i, timestamp=ts))
+                fvgs.append(FVG(
+                    "bullish", top=top, bottom=bottom, mid=mid,
+                    idx=i, timestamp=ts,
+                    trigger_high=trigger_high, trigger_low=trigger_low,
+                ))
 
         # ── Bearish FVG ───────────────────────────────────────────────
         elif prev2_low > curr_high:
@@ -68,7 +81,11 @@ def detect_fvgs(df: pd.DataFrame, lookback: int = 50) -> list[FVG]:
 
             mitigated = _is_mitigated_bear(sub, i, mid)
             if not mitigated:
-                fvgs.append(FVG("bearish", top=top, bottom=bottom, mid=mid, idx=i, timestamp=ts))
+                fvgs.append(FVG(
+                    "bearish", top=top, bottom=bottom, mid=mid,
+                    idx=i, timestamp=ts,
+                    trigger_high=trigger_high, trigger_low=trigger_low,
+                ))
 
     # Sort newest first
     fvgs.sort(key=lambda f: f.idx, reverse=True)

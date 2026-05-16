@@ -6,6 +6,9 @@ Telegram notifier + bot polling.
 send_signal(sig, chat_id)       → send ONE signal immediately
 send_result(result, chat_id)    → send full screener run summary
 TelegramBot                     → polling bot for /run /status /help
+
+🆕 v2: Enhanced signal format with Volume Spike, MSS, HTF alignment,
+       Dynamic SL, and Trailing Stop info.
 """
 
 from __future__ import annotations
@@ -63,18 +66,24 @@ def _fmt_signal(sig: dict) -> str:
     """
     Render a single signal as a Telegram message.
 
-    Example output:
+    Example output (v2):
     ─────────────────────────────────
     🟢🔥 LONG STRONG — BTC  •  15m
     ─────────────────────────────────
     📍 Entry   : 68,420.00
-    🛑 SL      : 67,900.00   (-0.76%)
+    🛑 SL      : 67,900.00   (-0.76%)  🔒 Dynamic
     🎯 TP1     : 68,940.00   (+0.76%)
-    🏆 TP2     : 69,460.00   (+1.52%)  ← min target RR 1:2
+    🏆 TP2     : 69,460.00   (+1.52%)  ← RR 1:2
 
     📊 RSI : 44.2   |   Dist VWAP : +0.18%
     🔲 FVG : 68,100 – 68,350  (bullish)
     📈 RR  : 1 : 2.00
+
+    📦 Vol Spike : ✅ 1.45x avg
+    🔄 MSS      : ✅ Swing break confirmed
+    🕐 HTF 1H   : ✅ Aligned
+
+    💡 Exit: Trailing Stop setelah TP1
     ─────────────────────────────────
     """
     d    = sig["direction"]
@@ -94,6 +103,14 @@ def _fmt_signal(sig: dict) -> str:
     fvg_t = sig["fvg_top"]
     fvg_k = sig.get("fvg_type", "")
 
+    # New fields
+    vol_spike     = sig.get("vol_spike", True)
+    vol_ratio     = sig.get("vol_ratio", 1.0)
+    vol_healthy   = sig.get("vol_healthy", True)
+    mss_confirmed = sig.get("mss_confirmed", True)
+    htf_aligned   = sig.get("htf_aligned", True)
+    sl_type       = sig.get("sl_type", "static")
+
     sl_pct  = (sl  - entry) / entry * 100
     tp1_pct = (tp1 - entry) / entry * 100
     tp2_pct = (tp2 - entry) / entry * 100
@@ -105,21 +122,39 @@ def _fmt_signal(sig: dict) -> str:
         icon = "🔴🔥" if strong else "🔴"
         label = "SHORT STRONG" if strong else "SHORT"
 
+    sl_label = "🔒 Dynamic" if sl_type == "dynamic" else ""
+
     divider = "─" * 36
     lines = [
         divider,
         f"{icon} <b>{label}</b>  —  <b>{sym}</b>  •  {tf}",
         divider,
         f"📍 Entry   :  <code>{_fmt_price(entry)}</code>",
-        f"🛑 SL      :  <code>{_fmt_price(sl)}</code>   ({sl_pct:+.2f}%)",
+        f"🛑 SL      :  <code>{_fmt_price(sl)}</code>   ({sl_pct:+.2f}%)  {sl_label}",
         f"🎯 TP1     :  <code>{_fmt_price(tp1)}</code>   ({tp1_pct:+.2f}%)",
         f"🏆 TP2     :  <code>{_fmt_price(tp2)}</code>   ({tp2_pct:+.2f}%)  ← RR 1:{rr:.1f}",
         "",
         f"📊 RSI : <b>{rsi}</b>   |   Dist VWAP : {dist:+.3f}%",
         f"🔲 FVG : <code>{_fmt_price(fvg_b)}</code> – <code>{_fmt_price(fvg_t)}</code>  ({fvg_k})",
         f"📈 RR  : 1 : {rr:.2f}   {conv}",
-        divider,
+        "",
     ]
+
+    # ── New filter info ───────────────────────────────────────────────
+    vol_icon = "✅" if vol_spike else "❌"
+    vol_h_icon = "" if vol_healthy else "  ⚠️ Vol↓"
+    lines.append(f"📦 Vol   : {vol_icon} {vol_ratio:.2f}x avg{vol_h_icon}")
+
+    mss_icon = "✅" if mss_confirmed else "❌"
+    lines.append(f"🔄 MSS   : {mss_icon} {'Swing break confirmed' if mss_confirmed else 'No break'}")
+
+    htf_icon = "✅" if htf_aligned else "⚠️"
+    lines.append(f"🕐 HTF   : {htf_icon} {'Aligned' if htf_aligned else 'Berlawanan'}")
+
+    lines.append("")
+    lines.append("💡 <i>Exit: Trailing Stop aktif setelah TP1</i>")
+    lines.append(divider)
+
     return "\n".join(lines)
 
 
@@ -138,33 +173,39 @@ def _fmt_summary(result: dict, top_n: int = 5) -> str:
         f"📊 <b>VWAP WEEKLY SCREENER</b>  •  {tf}  •  {scanned}",
         f"🔍 Scanned: {stats.get('total_scanned',0)} coins  |  "
         f"Signals: {total_l}L  {total_s}S",
+        f"🔧 <i>Filters: VolSpike≥30% | MSS | HTF(1H) | DynSL</i>",
         "",
     ]
 
     if longs:
         lines.append("🟢 <b>LONG</b>  —  FVG bounce + above VWAP weekly mid")
-        lines.append(f"{'Symbol':<8}  {'RSI':>5}  {'Dist':>7}  {'RR':>5}  {'Conviction'}")
+        lines.append(f"{'Symbol':<8}  {'RSI':>5}  {'Dist':>7}  {'RR':>5}  {'Vol':>5}  {'Conviction'}")
         for s in longs:
             flag = "🔥" if s["strong"] else "  "
+            vol_r = s.get("vol_ratio", 1.0)
+            htf   = "✓" if s.get("htf_aligned", True) else "✗"
             lines.append(
                 f"🟢{flag} {s['symbol']:<7}  {s['rsi']:>5}  "
-                f"{s['dist_pct']:>+6.2f}%  {s['rr']:>4.1f}  {s['conviction']}"
+                f"{s['dist_pct']:>+6.2f}%  {s['rr']:>4.1f}  {vol_r:>4.1f}x  {s['conviction']} {htf}"
             )
         lines.append("")
 
     if shorts:
         lines.append("🔴 <b>SHORT</b>  —  FVG rejection + below VWAP weekly mid")
-        lines.append(f"{'Symbol':<8}  {'RSI':>5}  {'Dist':>7}  {'RR':>5}  {'Conviction'}")
+        lines.append(f"{'Symbol':<8}  {'RSI':>5}  {'Dist':>7}  {'RR':>5}  {'Vol':>5}  {'Conviction'}")
         for s in shorts:
             flag = "🔥" if s["strong"] else "  "
+            vol_r = s.get("vol_ratio", 1.0)
+            htf   = "✓" if s.get("htf_aligned", True) else "✗"
             lines.append(
                 f"🔴{flag} {s['symbol']:<7}  {s['rsi']:>5}  "
-                f"{s['dist_pct']:>+6.2f}%  {s['rr']:>4.1f}  {s['conviction']}"
+                f"{s['dist_pct']:>+6.2f}%  {s['rr']:>4.1f}  {vol_r:>4.1f}x  {s['conviction']} {htf}"
             )
         lines.append("")
 
     if not longs and not shorts:
-        lines.append("⏳ Belum ada sinyal yang memenuhi kriteria FVG + RR 1:2.")
+        lines.append("⏳ Belum ada sinyal yang memenuhi kriteria.")
+        lines.append("<i>Filter aktif: FVG + RR 1:2 + VolSpike + MSS + HTF</i>")
         lines.append("Screener tetap jalan otomatis setiap candle 15m.")
 
     return "\n".join(lines)
@@ -212,7 +253,8 @@ def send_result(result: dict, chat_id: str, top_n: int = 5) -> None:
             f"📭 <b>VWAP Screener</b>  •  {result.get('timeframe','?')}\n"
             f"🕐 {result.get('scanned_at','')}\n"
             f"🔍 Scanned {result.get('stats',{}).get('total_scanned',0)} coins\n"
-            f"⏳ Tidak ada setup FVG + RR 1:2 saat ini."
+            f"⏳ Tidak ada setup yang memenuhi semua filter.\n"
+            f"<i>Filter: FVG + RR 1:2 + VolSpike≥30% + MSS + HTF(1H)</i>"
         )
         _send(token, chat_id, msg)
 
@@ -270,16 +312,21 @@ class TelegramBot:
 
         elif cmd == "/help":
             help_text = (
-                "📋 <b>VWAP Screener — Commands</b>\n\n"
+                "📋 <b>VWAP Screener v2 — Commands</b>\n\n"
                 "/run          — Jalankan screener sekarang (15m)\n"
                 "/run 1h       — Jalankan dengan timeframe lain\n"
                 "/status       — Info run terakhir + backtest 7 hari\n"
                 "/summary [N]  — Ringkasan N hari terakhir (default 7)\n"
                 "/help         — Daftar command\n\n"
-                "<b>Kriteria sinyal:</b>\n"
+                "<b>Kriteria sinyal v2:</b>\n"
                 "• Close di atas/bawah VWAP Weekly mid\n"
                 "• Entry di zona FVG Bullish/Bearish\n"
                 "• Minimum RR 1:2\n"
+                "• 📦 Volume Spike ≥ 30% dari avg 20 candle\n"
+                "• 🔄 Market Structure Shift (MSS) terkonfirmasi\n"
+                "• 🕐 HTF 1H VWAP alignment check\n"
+                "• 🛑 Dynamic SL (trigger candle + 0.2% buffer)\n"
+                "• 💡 Trailing Stop setelah TP1 hit\n"
                 "• Auto-alert setiap candle 15m"
             )
             _send(self.token, cid, help_text, "HTML")

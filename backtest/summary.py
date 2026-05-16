@@ -35,6 +35,7 @@ def build_summary_message(days: int = 7) -> str:
     sl_rate  = stats["sl"] / closed * 100 if closed > 0 else 0
     tp2_rate = stats["tp2"] / closed * 100 if closed > 0 else 0
     tp1_rate = stats["tp1"] / closed * 100 if closed > 0 else 0
+    tsl_rate = stats.get("tsl", 0) / closed * 100 if closed > 0 else 0
 
     now      = datetime.now(timezone.utc)
     date_end = now.strftime("%Y-%m-%d")
@@ -52,6 +53,7 @@ def build_summary_message(days: int = 7) -> str:
         f"Closed       : {closed}  (OPEN: {stats['open']})",
         f"TP2 ✅        : {stats['tp2']}  ({tp2_rate:.1f}%)",
         f"TP1          : {stats['tp1']}  ({tp1_rate:.1f}%)",
+        f"TSL ✅        : {stats.get('tsl', 0)}  ({tsl_rate:.1f}%)  💡 trailing",
         f"SL  ❌        : {stats['sl']}  ({sl_rate:.1f}%)",
         "",
         f"{win_emoji} Win rate  : <b>{stats['win_rate']:.1f}%</b>",

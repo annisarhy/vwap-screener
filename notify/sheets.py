@@ -74,6 +74,7 @@ HEADERS = [
     "Entry", "SL", "TP1", "TP2", "RR", "RSI",
     "FVG Type", "FVG Bottom", "FVG Top", "Conviction",
     "Current Price", "PnL %", "Status", "Notes",
+    "Vol Ratio", "MSS", "HTF", "Trailing SL",
 ]
 
 # Column indices (1-based for gspread)
@@ -148,7 +149,7 @@ def init_sheets() -> bool:
 def _fmt_header(ws: gspread.Worksheet) -> None:
     """Bold + freeze the header row, add column widths."""
     try:
-        ws.format("A1:R1", {
+        ws.format("A1:V1", {
             "textFormat"      : {"bold": True},
             "backgroundColor" : {"red": 0.16, "green": 0.19, "blue": 0.28},
             "horizontalAlignment": "CENTER",
@@ -165,7 +166,7 @@ def _fmt_row(ws: gspread.Worksheet, row: int, direction: str) -> None:
             color = {"red": 0.85, "green": 0.96, "blue": 0.85}
         else:
             color = {"red": 0.98, "green": 0.87, "blue": 0.87}
-        ws.format(f"A{row}:R{row}", {"backgroundColor": color})
+        ws.format(f"A{row}:V{row}", {"backgroundColor": color})
     except Exception:
         pass
 
@@ -200,6 +201,10 @@ def log_signal(sig: dict) -> bool:
         "0.00%",                # PnL % starts at 0
         "OPEN",                 # Status
         "",                     # Notes
+        sig.get("vol_ratio", ""),   # Vol Ratio
+        "✅" if sig.get("mss_confirmed") else "❌",  # MSS
+        "✅" if sig.get("htf_aligned") else "⚠️",    # HTF
+        sig.get("sl", ""),         # Trailing SL = initial SL
     ]
 
     try:
@@ -258,17 +263,51 @@ def _calc_pnl(direction: str, entry: float, exit_price: float) -> str:
 
 
 def _resolve_live(direction: str, entry: float, sl: float,
-                  tp1: float, tp2: float, current: float) -> str:
-    """Quick check vs current price only (for very fresh signals)."""
+                  tp1: float, tp2: float, current: float,
+                  trailing_sl: float = 0.0) -> str:
+    """
+    Quick check vs current price only (for very fresh signals).
+    🆕 Trailing Stop: after TP1, SL moves to breakeven then trails.
+    """
+    active_sl = trailing_sl if trailing_sl > 0 else sl
+
     if direction == "LONG":
         if current >= tp2: return "TP2 ✅"
-        if current >= tp1: return "TP1"
-        if current <= sl:  return "SL ❌"
+        if current >= tp1: return "TP1 🔒"   # trailing activated
+        if current <= active_sl: return "SL ❌"
     else:
         if current <= tp2: return "TP2 ✅"
-        if current <= tp1: return "TP1"
-        if current >= sl:  return "SL ❌"
+        if current <= tp1: return "TP1 🔒"
+        if current >= active_sl: return "SL ❌"
     return "OPEN"
+
+
+def _calc_trailing_sl(direction: str, entry: float, sl: float,
+                      current: float, old_trailing: float) -> float:
+    """
+    🆕 Calculate trailing stop level.
+    After TP1: SL moves to entry (breakeven).
+    Then trails at 50% of original risk distance behind price.
+    """
+    risk = abs(entry - sl)
+    trail_dist = risk * 0.5   # trail at 50% of original risk
+
+    if direction == "LONG":
+        # New trailing = current price - trail distance
+        new_trail = current - trail_dist
+        # Never go below entry (breakeven) once trailing starts
+        new_trail = max(new_trail, entry)
+        # Only move UP, never down
+        if old_trailing > 0:
+            return max(new_trail, old_trailing)
+        return new_trail
+    else:
+        # SHORT: trailing goes above price
+        new_trail = current + trail_dist
+        new_trail = min(new_trail, entry)  # never above entry
+        if old_trailing > 0:
+            return min(new_trail, old_trailing)
+        return new_trail
 
 
 def _backtest_resolve(
@@ -367,7 +406,8 @@ def _update_live_prices() -> None:
     for i, row in enumerate(all_rows[1:], start=2):
         if len(row) < 17:
             continue
-        if row[COL["Status"] - 1] in ("OPEN", "TP1", ""):
+        status = row[COL["Status"] - 1]
+        if status in ("OPEN", "TP1", "TP1 🔒", ""):
             open_rows.append((i, row))
 
     if not open_rows:
@@ -386,9 +426,10 @@ def _update_live_prices() -> None:
         print("[sheets] live: semua fetch gagal")
         return
 
-    price_col  = _col_letter(COL["Current Price"])
-    pnl_col    = _col_letter(COL["PnL %"])
-    status_col = _col_letter(COL["Status"])
+    price_col    = _col_letter(COL["Current Price"])
+    pnl_col      = _col_letter(COL["PnL %"])
+    status_col   = _col_letter(COL["Status"])
+    trail_sl_col = _col_letter(COL["Trailing SL"])
 
     updates: list[dict] = []
     to_recolor: list[tuple[int, str]] = []
@@ -408,8 +449,36 @@ def _update_live_prices() -> None:
         except (ValueError, IndexError):
             continue
 
+        # 🆕 Read existing trailing SL
+        old_trailing = 0.0
+        try:
+            trail_idx = COL["Trailing SL"] - 1
+            if len(row) > trail_idx and row[trail_idx]:
+                old_trailing = _tofloat(row[trail_idx])
+        except (ValueError, IndexError):
+            pass
+
+        cur_status = row[COL["Status"] - 1]
+
+        # 🆕 Trailing Stop logic
+        new_trailing = old_trailing
+        if cur_status in ("TP1", "TP1 🔒"):
+            # Already hit TP1 — calculate trailing SL
+            new_trailing = _calc_trailing_sl(dirn, entry, sl, curr, old_trailing)
+
         pnl        = _calc_pnl(dirn, entry, curr)
-        new_status = _resolve_live(dirn, entry, sl, tp1, tp2, curr)
+        new_status = _resolve_live(dirn, entry, sl, tp1, tp2, curr, new_trailing)
+
+        # If just hit TP1, activate trailing
+        if new_status == "TP1 🔒" and cur_status == "OPEN":
+            new_trailing = _calc_trailing_sl(dirn, entry, sl, curr, 0.0)
+
+        # 🆕 Check trailing SL hit for TP1 positions
+        if cur_status in ("TP1", "TP1 🔒") and new_trailing > 0:
+            if dirn == "LONG" and curr <= new_trailing:
+                new_status = "TSL ✅"   # Trailing Stop hit (profit)
+            elif dirn == "SHORT" and curr >= new_trailing:
+                new_status = "TSL ✅"
 
         # Update O + P + Q sekaligus tiap 60s
         updates.append({
@@ -417,7 +486,14 @@ def _update_live_prices() -> None:
             "values": [[curr, pnl, new_status]],
         })
 
-        if new_status in ("TP2 ✅", "SL ❌"):
+        # Update trailing SL column
+        if new_trailing != old_trailing and new_trailing > 0:
+            updates.append({
+                "range" : f"{trail_sl_col}{row_num}",
+                "values": [[round(new_trailing, 6)]],
+            })
+
+        if new_status in ("TP2 ✅", "SL ❌", "TSL ✅"):
             to_recolor.append((row_num, new_status))
 
     if updates:
@@ -432,12 +508,13 @@ def _update_live_prices() -> None:
 
     for row_num, status in to_recolor:
         try:
-            color = (
-                {"red": 0.72, "green": 0.93, "blue": 0.72}
-                if status == "TP2 ✅"
-                else {"red": 0.95, "green": 0.72, "blue": 0.72}
-            )
-            _ws.format(f"A{row_num}:R{row_num}", {"backgroundColor": color})
+            if status == "TP2 ✅":
+                color = {"red": 0.72, "green": 0.93, "blue": 0.72}
+            elif status == "TSL ✅":
+                color = {"red": 0.78, "green": 0.92, "blue": 0.85}   # teal for trailing win
+            else:
+                color = {"red": 0.95, "green": 0.72, "blue": 0.72}
+            _ws.format(f"A{row_num}:V{row_num}", {"backgroundColor": color})
         except Exception:
             pass
 
@@ -478,7 +555,7 @@ def _run_backtest_resolver() -> None:
         if len(row) < 17:
             continue
         cur_status = row[COL["Status"] - 1]
-        if cur_status not in ("OPEN", "TP1", ""):
+        if cur_status not in ("OPEN", "TP1", "TP1 🔒", ""):
             continue
 
         sym  = row[COL["Symbol"]    - 1]
@@ -514,7 +591,7 @@ def _run_backtest_resolver() -> None:
                 "range" : f"{status_col_letter}{i}",
                 "values": [[new_status]],
             })
-            if new_status in ("TP2 ✅", "SL ❌"):
+            if new_status in ("TP2 ✅", "SL ❌", "TSL ✅"):
                 to_recolor.append((i, new_status))
 
     if updates:
@@ -528,12 +605,13 @@ def _run_backtest_resolver() -> None:
     # Recolor closed rows AFTER batch update
     for row_num, status in to_recolor:
         try:
-            color = (
-                {"red": 0.72, "green": 0.93, "blue": 0.72}
-                if status == "TP2 ✅"
-                else {"red": 0.95, "green": 0.72, "blue": 0.72}
-            )
-            _ws.format(f"A{row_num}:R{row_num}", {"backgroundColor": color})
+            if status == "TP2 ✅":
+                color = {"red": 0.72, "green": 0.93, "blue": 0.72}
+            elif status == "TSL ✅":
+                color = {"red": 0.78, "green": 0.92, "blue": 0.85}
+            else:
+                color = {"red": 0.95, "green": 0.72, "blue": 0.72}
+            _ws.format(f"A{row_num}:V{row_num}", {"backgroundColor": color})
         except Exception:
             pass
     update_dashboard()
@@ -558,14 +636,16 @@ def get_sheet_stats() -> dict:
     try:
         rows = _ws.get_all_values()[1:]   # skip header
         total   = len(rows)
-        open_n  = sum(1 for r in rows if len(r) >= 17 and r[16] == "OPEN")
+        open_n  = sum(1 for r in rows if len(r) >= 17 and r[16] in ("OPEN",))
         tp2_n   = sum(1 for r in rows if len(r) >= 17 and "TP2" in r[16])
-        tp1_n   = sum(1 for r in rows if len(r) >= 17 and r[16] == "TP1")
-        sl_n    = sum(1 for r in rows if len(r) >= 17 and "SL" in r[16])
-        win_rate = tp2_n / (tp2_n + sl_n) * 100 if (tp2_n + sl_n) else 0
+        tp1_n   = sum(1 for r in rows if len(r) >= 17 and r[16] in ("TP1", "TP1 🔒"))
+        tsl_n   = sum(1 for r in rows if len(r) >= 17 and "TSL" in r[16])
+        sl_n    = sum(1 for r in rows if len(r) >= 17 and "SL" in r[16] and "TSL" not in r[16])
+        wins    = tp2_n + tsl_n
+        win_rate = wins / (wins + sl_n) * 100 if (wins + sl_n) else 0
         return {
             "total": total, "open": open_n,
-            "tp2": tp2_n, "tp1": tp1_n, "sl": sl_n,
+            "tp2": tp2_n, "tp1": tp1_n, "tsl": tsl_n, "sl": sl_n,
             "win_rate": win_rate,
         }
     except Exception:
@@ -593,7 +673,7 @@ def has_open_position(symbol: str, direction: str) -> bool:
             row_stat  = row[COL["Status"]    - 1]
             if (row_sym == symbol.upper()
                     and row_dir == direction.upper()
-                    and row_stat in ("OPEN", "TP1", "")):
+                    and row_stat in ("OPEN", "TP1", "TP1 🔒", "")):
                 return True
         return False
     except Exception:
