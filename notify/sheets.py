@@ -350,9 +350,9 @@ def price_updater_loop() -> None:
 
 def _update_live_prices() -> None:
     """
-    Ambil harga REALTIME semua coin yg masih OPEN/TP1,
-    update kolom Current Price (O) dan PnL % (P) saja.
-    Tidak menyentuh kolom Status — itu urusan _backtest_resolve_loop.
+    Ambil harga REALTIME semua coin OPEN/TP1.
+    Update kolom O (Current Price) + P (PnL %) + Q (Status) sekaligus.
+    Kalau harga live sudah lewat SL/TP → langsung close, tidak tunggu resolver.
     """
     if _ws is None:
         return
@@ -363,19 +363,17 @@ def _update_live_prices() -> None:
     if len(all_rows) <= 1:
         return
 
-    # Kumpulkan baris OPEN/TP1 beserta data yang dibutuhkan
     open_rows = []
     for i, row in enumerate(all_rows[1:], start=2):
         if len(row) < 17:
             continue
-        status = row[COL["Status"] - 1]
-        if status in ("OPEN", "TP1", ""):
+        if row[COL["Status"] - 1] in ("OPEN", "TP1", ""):
             open_rows.append((i, row))
 
     if not open_rows:
         return
 
-    # Fetch harga per symbol unik (batch)
+    # Fetch harga per symbol unik
     symbols = {row[COL["Symbol"] - 1] for _, row in open_rows}
     prices: dict[str, float] = {}
     for sym in symbols:
@@ -388,10 +386,12 @@ def _update_live_prices() -> None:
         print("[sheets] live: semua fetch gagal")
         return
 
-    # Build batch update — hanya kolom O (Current Price) dan P (PnL %)
-    price_col = _col_letter(COL["Current Price"])
-    pnl_col   = _col_letter(COL["PnL %"])
-    updates   = []
+    price_col  = _col_letter(COL["Current Price"])
+    pnl_col    = _col_letter(COL["PnL %"])
+    status_col = _col_letter(COL["Status"])
+
+    updates: list[dict] = []
+    to_recolor: list[tuple[int, str]] = []
 
     for row_num, row in open_rows:
         sym  = row[COL["Symbol"]    - 1]
@@ -399,24 +399,47 @@ def _update_live_prices() -> None:
         curr = prices.get(sym)
         if curr is None:
             continue
+
         try:
             entry = _tofloat(row[COL["Entry"] - 1])
+            sl    = _tofloat(row[COL["SL"]    - 1])
+            tp1   = _tofloat(row[COL["TP1"]   - 1])
+            tp2   = _tofloat(row[COL["TP2"]   - 1])
         except (ValueError, IndexError):
             continue
 
-        pnl = _calc_pnl(dirn, entry, curr)
+        pnl        = _calc_pnl(dirn, entry, curr)
+        new_status = _resolve_live(dirn, entry, sl, tp1, tp2, curr)
+
+        # Update O + P + Q sekaligus tiap 60s
         updates.append({
-            "range" : f"{price_col}{row_num}:{pnl_col}{row_num}",
-            "values": [[curr, pnl]],
+            "range" : f"{price_col}{row_num}:{status_col}{row_num}",
+            "values": [[curr, pnl, new_status]],
         })
+
+        if new_status in ("TP2 ✅", "SL ❌"):
+            to_recolor.append((row_num, new_status))
 
     if updates:
         try:
             with _lock:
                 _ws.batch_update(updates, value_input_option="RAW")
-            print(f"[sheets] live: updated {len(updates)} prices")
+            closed = len(to_recolor)
+            print(f"[sheets] live: updated {len(updates)} rows  ({closed} closed)")
         except Exception as e:
             print(f"[sheets] live batch_update error: {e}")
+            return
+
+    for row_num, status in to_recolor:
+        try:
+            color = (
+                {"red": 0.72, "green": 0.93, "blue": 0.72}
+                if status == "TP2 ✅"
+                else {"red": 0.95, "green": 0.72, "blue": 0.72}
+            )
+            _ws.format(f"A{row_num}:R{row_num}", {"backgroundColor": color})
+        except Exception:
+            pass
 
 
 def _backtest_resolve_loop() -> None:
