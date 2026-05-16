@@ -59,9 +59,9 @@ MIN_RR              = 2.0      # minimum risk:reward
 RSI_PERIOD          = 14
 VWAP_STD_MULT       = 1.0      # band = VWAP ± N×stddev
 FVG_LOOKBACK        = 60       # candles to look back for FVG
-VOL_SPIKE_THRESHOLD = 1.30     # 130% of avg = 30% spike
+VOL_SPIKE_THRESHOLD = 1.15     # 115% of avg = 15% spike (soft filter)
 VOL_AVG_PERIOD      = 20       # rolling average window for volume
-MSS_LOOKBACK        = 5        # candles to check for swing high/low break
+MSS_LOOKBACK        = 3        # candles to check for swing high/low break (relaxed)
 
 # ── Exchange helpers ──────────────────────────────────────────────────────────
 _exchanges: dict[str, ccxt.Exchange] = {}
@@ -322,17 +322,11 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
 
         if bull_fvg and (in_fvg or bounced_from):
 
-            # ── Filter 1: Volume Spike ────────────────────────────────
-            if not vol_spike:
-                return None   # volume too low on FVG bounce
-
-            # ── Filter 1b: Volume Divergence ──────────────────────────
+            # ── Soft Filter 1: Volume Spike (conviction modifier) ─────
             vol_healthy = _check_volume_divergence(df, "LONG")
 
-            # ── Filter 2: Market Structure Shift ──────────────────────
+            # ── Soft Filter 2: Market Structure Shift ─────────────────
             mss_ok = _check_mss(df, "LONG")
-            if not mss_ok:
-                return None   # structure still bearish
 
             # ── Dynamic SL ────────────────────────────────────────────
             # Use the LOWER of FVG bottom and trigger candle low
@@ -353,7 +347,7 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
             if rr < MIN_RR:
                 return None
 
-            # ── Filter 3: HTF alignment (soft) ────────────────────────
+            # ── Soft Filter 3: HTF alignment ──────────────────────────
             htf_aligned, htf_vwap = _check_htf_alignment(symbol, "LONG")
 
             strong = bounced_from and (rsi < 50) and vol_spike and mss_ok
@@ -401,17 +395,11 @@ def _analyse_symbol(symbol: str, timeframe: str) -> Optional[dict]:
 
         if bear_fvg and (in_fvg or rejected_at):
 
-            # ── Filter 1: Volume Spike ────────────────────────────────
-            if not vol_spike:
-                return None
-
-            # ── Filter 1b: Volume Divergence ──────────────────────────
+            # ── Soft Filter 1: Volume Spike (conviction modifier) ─────
             vol_healthy = _check_volume_divergence(df, "SHORT")
 
-            # ── Filter 2: Market Structure Shift ──────────────────────
+            # ── Soft Filter 2: Market Structure Shift ─────────────────
             mss_ok = _check_mss(df, "SHORT")
-            if not mss_ok:
-                return None
 
             # ── Dynamic SL ────────────────────────────────────────────
             # Use the HIGHER of FVG top and trigger candle high
@@ -527,9 +515,9 @@ def _conviction(rr: float, rsi: float, dist_pct: float, direction: str, *,
     if htf_aligned:
         score += 1
 
-    if score >= 7:
+    if score >= 6:
         return "🟢 High"
-    elif score >= 4:
+    elif score >= 3:
         return "🟡 Medium"
     else:
         return "🔴 Low"
@@ -549,7 +537,7 @@ def run_screener(
     longs, shorts = [], []
 
     print(f"[engine] Scanning {len(symbols)} symbols on {timeframe}...")
-    print(f"[engine] Filters: VolSpike≥{VOL_SPIKE_THRESHOLD:.0%} | MSS(swing{MSS_LOOKBACK}) | HTF(1H) | DynSL")
+    print(f"[engine] Soft filters: Vol≥{VOL_SPIKE_THRESHOLD:.0%} | MSS(swing{MSS_LOOKBACK}) | HTF(1H) | DynSL")
 
     for sym in symbols:
         try:
