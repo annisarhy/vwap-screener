@@ -441,6 +441,9 @@ def _update_live_prices() -> None:
         except Exception:
             pass
 
+    # Refresh dashboard setiap live update
+    update_dashboard()
+
 
 def _backtest_resolve_loop() -> None:
     """
@@ -533,6 +536,9 @@ def _run_backtest_resolver() -> None:
             _ws.format(f"A{row_num}:R{row_num}", {"backgroundColor": color})
         except Exception:
             pass
+    update_dashboard()
+    # Refresh dashboard setelah resolver update
+
 
 
 def _col_letter(n: int) -> str:
@@ -592,3 +598,373 @@ def has_open_position(symbol: str, direction: str) -> bool:
         return False
     except Exception:
         return False   # fail-open: kalau error, izinkan sinyal lewat
+
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+DASHBOARD_TAB = "Dashboard"
+_dash_ws = None
+
+
+def _get_dash_ws():
+    global _dash_ws
+    if _dash_ws is not None:
+        return _dash_ws
+    try:
+        sh = _gc.open_by_key(SHEET_ID)
+        try:
+            _dash_ws = sh.worksheet(DASHBOARD_TAB)
+        except gspread.WorksheetNotFound:
+            _dash_ws = sh.add_worksheet(title=DASHBOARD_TAB, rows=80, cols=14)
+        return _dash_ws
+    except Exception as e:
+        print(f"[dashboard] init error: {e}")
+        return None
+
+
+def _rgb(r, g, b):
+    return {"red": r/255, "green": g/255, "blue": b/255}
+
+
+def _fmt(dws, range_: str, fmt: dict):
+    try: dws.format(range_, fmt)
+    except Exception: pass
+
+
+def _merge(dws, range_: str):
+    try:
+        sh = _gc.open_by_key(SHEET_ID)
+        sid = dws.id
+        body = {"requests": [{"mergeCells": {
+            "range": _parse_range(range_, sid),
+            "mergeType": "MERGE_ALL"
+        }}]}
+        sh.batch_update(body)
+    except Exception:
+        pass
+
+
+def _parse_range(a1: str, sheet_id: int) -> dict:
+    """Convert A1:B2 notation to GridRange dict."""
+    import re
+    m = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", a1)
+    if not m:
+        return {}
+    def col_idx(s): return sum((ord(c)-64)*26**i for i, c in enumerate(reversed(s))) - 1
+    return {
+        "sheetId": sheet_id,
+        "startColumnIndex": col_idx(m.group(1)),
+        "endColumnIndex":   col_idx(m.group(3)) + 1,
+        "startRowIndex":    int(m.group(2)) - 1,
+        "endRowIndex":      int(m.group(4)),
+    }
+
+
+def _spark_bar(value: float, max_val: float = 100, width: int = 10) -> str:
+    """ASCII progress bar untuk Google Sheets."""
+    filled = int(round(value / max_val * width)) if max_val > 0 else 0
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def update_dashboard() -> None:
+    """
+    Tulis ulang tab Dashboard dengan visual dashboard lengkap.
+
+    Layout (kolom A-M, 14 kolom):
+    ┌─────────────────────────────────────────────────────┐
+    │  ROW 1-2   : Header / judul                         │
+    │  ROW 3     : spacer                                  │
+    │  ROW 4-5   : KPI cards  (5 metric dalam 1 baris)    │
+    │  ROW 6     : spacer                                  │
+    │  ROW 7-13  : LONG stats (kiri) | SHORT stats (kanan)│
+    │  ROW 14    : spacer                                  │
+    │  ROW 15-16 : Win Rate visual bar                     │
+    │  ROW 17    : spacer                                  │
+    │  ROW 18-...: 15 sinyal terbaru (tabel lengkap)      │
+    └─────────────────────────────────────────────────────┘
+    """
+    if not _enabled or _ws is None:
+        return
+    dws = _get_dash_ws()
+    if dws is None:
+        return
+
+    try:
+        with _lock:
+            rows = _ws.get_all_values()[1:]
+    except Exception as e:
+        print(f"[dashboard] read error: {e}")
+        return
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # ── Hitung stats ──────────────────────────────────────────────────
+    total = len(rows)
+    open_n = tp1_n = tp2_n = sl_n = 0
+    pnl_sum = pnl_tp = pnl_sl = 0.0
+    long_tp2 = long_tp1 = long_sl = 0;  long_pnl = 0.0
+    short_tp2 = short_tp1 = short_sl = 0; short_pnl = 0.0
+    pnl_history = []
+
+    for r in rows:
+        if len(r) < 17:
+            continue
+        status = r[COL["Status"] - 1]
+        dirn   = r[COL["Direction"] - 1].upper()
+        raw_p  = r[COL["PnL %"] - 1].replace("%","").replace("+","").strip()
+        try:
+            pv = float(raw_p.replace(",", ".")) if raw_p and raw_p != "–" else 0.0
+        except ValueError:
+            pv = 0.0
+
+        if "TP2" in status:
+            tp2_n += 1; pnl_sum += pv; pnl_tp += pv; pnl_history.append(pv)
+            if dirn == "LONG":  long_tp2  += 1; long_pnl  += pv
+            else:               short_tp2 += 1; short_pnl += pv
+        elif status == "TP1":
+            tp1_n += 1; pnl_sum += pv; pnl_tp += pv; pnl_history.append(pv)
+            if dirn == "LONG":  long_tp1  += 1; long_pnl  += pv
+            else:               short_tp1 += 1; short_pnl += pv
+        elif "SL" in status:
+            sl_n  += 1; pnl_sum += pv; pnl_sl  += pv; pnl_history.append(pv)
+            if dirn == "LONG":  long_sl   += 1; long_pnl  += pv
+            else:               short_sl  += 1; short_pnl += pv
+        else:
+            open_n += 1
+
+    closed   = tp2_n + tp1_n + sl_n
+    win_rate = (tp2_n + tp1_n) / closed * 100 if closed > 0 else 0.0
+    avg_win  = pnl_tp / (tp2_n + tp1_n)  if (tp2_n + tp1_n) > 0 else 0.0
+    avg_loss = pnl_sl / sl_n              if sl_n > 0          else 0.0
+    pnl_sign = "+" if pnl_sum >= 0 else ""
+
+    l_closed = long_tp2 + long_tp1 + long_sl
+    s_closed = short_tp2 + short_tp1 + short_sl
+    l_wr = (long_tp2 + long_tp1) / l_closed * 100  if l_closed > 0 else 0.0
+    s_wr = (short_tp2 + short_tp1) / s_closed * 100 if s_closed > 0 else 0.0
+
+    wr_bar   = _spark_bar(win_rate, 100, 20)
+    l_wr_bar = _spark_bar(l_wr, 100, 14)
+    s_wr_bar = _spark_bar(s_wr, 100, 14)
+
+    # ── Build grid 14 kolom (A–N) ─────────────────────────────────────
+    # Kolom mapping: A B C D E F G H I J K L M N
+    empty14 = [""] * 14
+
+    def row14(*vals):
+        r = list(vals)
+        r += [""] * (14 - len(r))
+        return r[:14]
+
+    # Sinyal terbaru (15 rows)
+    recent = rows[-15:][::-1]
+    recent_grid = []
+    for r in recent:
+        if len(r) < 17:
+            continue
+        ts   = r[COL["Timestamp (UTC)"] - 1][5:16]
+        sym  = r[COL["Symbol"]    - 1]
+        dirn = r[COL["Direction"] - 1]
+        tf   = r[COL["Timeframe"] - 1]
+        ent  = r[COL["Entry"]     - 1]
+        sl_v = r[COL["SL"]        - 1]
+        tp2v = r[COL["TP2"]       - 1]
+        rr   = r[COL["RR"]        - 1] if len(r) > COL["RR"]-1 else ""
+        conv = r[COL["Conviction"]- 1]
+        curr = r[COL["Current Price"] - 1]
+        pnl  = r[COL["PnL %"]     - 1]
+        stat = r[COL["Status"]    - 1]
+        recent_grid.append(row14(ts, sym, dirn, tf, ent, sl_v, tp2v, rr, conv, curr, pnl, stat))
+
+    # Assemble full grid
+    grid = []
+
+    # ROW 1-2: Header
+    grid.append(row14("📊  VWAP SCREENER — PERFORMANCE DASHBOARD", "", "", "", "", "", "", "", "", "", "", "", f"🕐 {now_str}", ""))
+    grid.append(empty14[:])
+
+    # ROW 3: KPI labels
+    grid.append(row14("TOTAL SINYAL","","","WIN RATE","","","TOTAL PnL","","","AVG PROFIT","","","AVG LOSS",""))
+
+    # ROW 4: KPI values
+    pnl_str = f"{pnl_sign}{pnl_sum:.2f}%"
+    grid.append(row14(total,"","",f"{win_rate:.1f}%","","",pnl_str,"","",f"+{avg_win:.2f}%","","",f"{avg_loss:.2f}%",""))
+
+    # ROW 5: KPI sub
+    grid.append(row14(f"{open_n} open  |  {closed} closed","","",f"{tp2_n} TP2  ·  {tp1_n} TP1  ·  {sl_n} SL","","","closed trades","","","per trade menang","","","per trade kalah",""))
+
+    grid.append(empty14[:])
+
+    # ROW 7: Section headers LONG | SHORT
+    grid.append(row14("🟢  LONG  —  Performance","","","","","","","🔴  SHORT  —  Performance","","","","","",""))
+
+    # ROW 8: Win rate bars
+    grid.append(row14(f"Win Rate  {l_wr:.1f}%","","","","","","",f"Win Rate  {s_wr:.1f}%","","","","","",""))
+    grid.append(row14(l_wr_bar,"","","","","","",s_wr_bar,"","","","","",""))
+
+    # ROW 10-13: Stats rows
+    for label, lv, sv in [
+        ("TP2 ✅",    long_tp2,  short_tp2),
+        ("TP1",       long_tp1,  short_tp1),
+        ("SL ❌",      long_sl,   short_sl),
+        ("Net PnL",   f"{'+'if long_pnl>=0 else''}{long_pnl:.2f}%", f"{'+'if short_pnl>=0 else''}{short_pnl:.2f}%"),
+    ]:
+        grid.append(row14(label, lv, "", "", "", "", "", label, sv, "", "", "", "", ""))
+
+    grid.append(empty14[:])
+
+    # ROW 15-16: Overall win rate bar
+    grid.append(row14("📈  OVERALL WIN RATE","","","","","","","","","","","","",""))
+    grid.append(row14(f"{win_rate:.1f}%  {wr_bar}  ({tp2_n+tp1_n} win / {sl_n} loss dari {closed} closed)","","","","","","","","","","","","",""))
+
+    grid.append(empty14[:])
+
+    # ROW 18: Table header
+    grid.append(row14("Timestamp","Symbol","Direction","TF","Entry","SL","TP2","RR","Conviction","Current Price","PnL %","Status"))
+
+    # ROW 19+: Data rows
+    grid.extend(recent_grid)
+
+    # ── Write ──────────────────────────────────────────────────────────
+    try:
+        dws.clear()
+        end_row = len(grid)
+        dws.update(f"A1:N{end_row}", grid, value_input_option="RAW")
+        time.sleep(0.5)
+
+        # ── Formatting ─────────────────────────────────────────────────
+        # Row 1: header bar
+        _fmt(dws, "A1:N1", {
+            "backgroundColor": _rgb(30, 40, 58),
+            "textFormat": {"bold": True, "fontSize": 14,
+                           "foregroundColor": {"red":1,"green":1,"blue":1}},
+            "verticalAlignment": "MIDDLE",
+        })
+
+        # KPI label row (row 3)
+        _fmt(dws, "A3:N3", {
+            "backgroundColor": _rgb(240, 242, 246),
+            "textFormat": {"bold": True, "fontSize": 9,
+                           "foregroundColor": {"red":0.4,"green":0.4,"blue":0.5}},
+            "horizontalAlignment": "CENTER",
+        })
+
+        # KPI value row (row 4)
+        _fmt(dws, "A4:N4", {
+            "textFormat": {"bold": True, "fontSize": 18},
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE",
+        })
+        # Win rate color
+        wr_color = _rgb(46,139,87) if win_rate >= 60 else (_rgb(200,150,30) if win_rate >= 40 else _rgb(180,50,50))
+        _fmt(dws, "D4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": wr_color}})
+
+        # PnL color
+        pnl_color = _rgb(46,139,87) if pnl_sum >= 0 else _rgb(180,50,50)
+        _fmt(dws, "G4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": pnl_color}})
+
+        # KPI sub row (row 5)
+        _fmt(dws, "A5:N5", {
+            "textFormat": {"fontSize": 9, "foregroundColor": {"red":0.5,"green":0.5,"blue":0.6}},
+            "horizontalAlignment": "CENTER",
+        })
+
+        # LONG section header (row 7)
+        _fmt(dws, "A7:G7", {
+            "backgroundColor": _rgb(232, 248, 238),
+            "textFormat": {"bold": True, "fontSize": 11,
+                           "foregroundColor": _rgb(30, 120, 70)},
+        })
+        # SHORT section header (row 7)
+        _fmt(dws, "H7:N7", {
+            "backgroundColor": _rgb(255, 235, 235),
+            "textFormat": {"bold": True, "fontSize": 11,
+                           "foregroundColor": _rgb(160, 40, 40)},
+        })
+
+        # Win rate label rows (8-9)
+        _fmt(dws, "A8:G8", {"textFormat": {"bold": True, "fontSize": 11}})
+        _fmt(dws, "H8:N8", {"textFormat": {"bold": True, "fontSize": 11}})
+        _fmt(dws, "A9:G9", {"textFormat": {"fontFamily": "Courier New", "fontSize": 10,
+                              "foregroundColor": _rgb(46,139,87)}})
+        _fmt(dws, "H9:N9", {"textFormat": {"fontFamily": "Courier New", "fontSize": 10,
+                              "foregroundColor": _rgb(160,40,40)}})
+
+        # Win rate overall bar (row 16)
+        _fmt(dws, "A16:N16", {
+            "backgroundColor": _rgb(245, 248, 255),
+            "textFormat": {"fontFamily": "Courier New", "fontSize": 11, "bold": True},
+        })
+
+        # Table header (row 18)
+        table_row = 18
+        _fmt(dws, f"A{table_row}:N{table_row}", {
+            "backgroundColor": _rgb(50, 65, 90),
+            "textFormat": {"bold": True, "fontSize": 10,
+                           "foregroundColor": {"red":1,"green":1,"blue":1}},
+            "horizontalAlignment": "CENTER",
+        })
+
+        # Data rows — color by status
+        for i, r in enumerate(recent_grid):
+            row_num = table_row + 1 + i
+            stat = r[11] if len(r) > 11 else ""
+            if "TP2" in stat:
+                bg = _rgb(230, 248, 234)
+            elif stat == "TP1":
+                bg = _rgb(225, 240, 255)
+            elif "SL" in stat:
+                bg = _rgb(255, 232, 230)
+            else:
+                bg = _rgb(250, 250, 252)
+            _fmt(dws, f"A{row_num}:N{row_num}", {"backgroundColor": bg, "fontSize": 10})
+            # Bold PnL column (K = col 11)
+            pnl_val_str = r[10] if len(r) > 10 else "0"
+            try:
+                pv = float(str(pnl_val_str).replace("%","").replace("+","").replace(",","."))
+                pc = _rgb(30,130,60) if pv >= 0 else _rgb(180,50,50)
+            except Exception:
+                pc = _rgb(80,80,80)
+            _fmt(dws, f"K{row_num}", {"textFormat": {"bold": True, "foregroundColor": pc}})
+
+        # Column widths via spreadsheet API
+        sh = _gc.open_by_key(SHEET_ID)
+        sid = dws.id
+        col_widths = [
+            (0, 150),   # A: timestamp
+            (1, 80),    # B: symbol
+            (2, 70),    # C: direction
+            (3, 45),    # D: TF
+            (4, 90),    # E: entry
+            (5, 90),    # F: SL
+            (6, 90),    # G: TP2
+            (7, 45),    # H: RR
+            (8, 90),    # I: conviction
+            (9, 100),   # J: current price
+            (10, 75),   # K: PnL
+            (11, 80),   # L: status
+        ]
+        requests = [{"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS",
+                      "startIndex": ci, "endIndex": ci+1},
+            "properties": {"pixelSize": px},
+            "fields": "pixelSize"
+        }} for ci, px in col_widths]
+        # Row heights
+        requests.append({"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 44}, "fields": "pixelSize"
+        }})
+        requests.append({"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 3, "endIndex": 4},
+            "properties": {"pixelSize": 40}, "fields": "pixelSize"
+        }})
+        sh.batch_update({"requests": requests})
+
+        # Freeze header row
+        dws.freeze(rows=1)
+
+        print(f"[dashboard] ✅ Updated — WR={win_rate:.1f}% PnL={pnl_sign}{pnl_sum:.2f}%  ({len(recent_grid)} rows)")
+    except Exception as e:
+        print(f"[dashboard] write error: {e}")
