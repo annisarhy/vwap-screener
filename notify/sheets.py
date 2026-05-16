@@ -806,9 +806,9 @@ def update_daily_pnl() -> None:
     # Sort dates newest-first, limit 60 days
     sorted_dates = sorted(daily.keys(), reverse=True)[:60]
 
-    # ── Read user filter date from B2 ─────────────────────────────
+    # ── Read user filter date from A3 ─────────────────────────────
     try:
-        filter_date = dws.acell("B2").value or ""
+        filter_date = dws.acell("A3").value or ""
         filter_date = filter_date.strip()
     except Exception:
         filter_date = ""
@@ -821,17 +821,17 @@ def update_daily_pnl() -> None:
         closed = d["wins"] + d["losses"]
         wr     = d["wins"] / closed * 100 if closed > 0 else 0.0
         pnl_s  = f"{'+'if d['pnl']>=0 else''}{d['pnl']:.2f}%"
-        best_s = f"+{d['best']:.2f}% ({d['best_sym']})" if d["best_sym"] else "—"
-        worst_s= f"{d['worst']:.2f}% ({d['worst_sym']})" if d["worst_sym"] else "—"
+        best_s = f"+{d['best']:.2f}% {d['best_sym']}" if d["best_sym"] else "—"
+        worst_s= f"{d['worst']:.2f}% {d['worst_sym']}" if d["worst_sym"] else "—"
         return [
             d["total"], closed, d["wins"], d["losses"],
             f"{wr:.1f}%", pnl_s,
-            f"L {d['long_w']}W/{d['long_l']}L",
-            f"S {d['short_w']}W/{d['short_l']}L",
+            f"{d['long_w']}W/{d['long_l']}L",
+            f"{d['short_w']}W/{d['short_l']}L",
             best_s, worst_s,
         ]
 
-    fd_stats = _day_stats_row(filter_date) if filter_date else ["(ketik tanggal di B2)"] + [""] * 9
+    fd_stats = _day_stats_row(filter_date) if filter_date and filter_date != "YYYY-MM-DD" else ["—"] * 10
 
     # ── Build grid ────────────────────────────────────────────────
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -843,17 +843,21 @@ def update_daily_pnl() -> None:
     grid = []
     # ROW 1: Header
     grid.append(row16("📅  DAILY PnL REVIEW","","","","","","","","","","","","","",f"🕐 {now_str}",""))
-    # ROW 2: Filter row
-    grid.append(row16("🔍 Filter Tanggal:", filter_date if filter_date else "YYYY-MM-DD",
+    
+    # ROW 2: Filter Headers (Aligns with table columns)
+    grid.append(row16("🔍 Cari (Edit A3)", "Total", "Closed", "W", "L",
+        "Win Rate", "Net PnL", "LONG", "SHORT", "Best Trade", "Worst Trade",
+        "", "", "", "", ""))
+        
+    # ROW 3: Filter Values
+    grid.append(row16(filter_date if filter_date else "YYYY-MM-DD",
         fd_stats[0], fd_stats[1], fd_stats[2], fd_stats[3],
         fd_stats[4], fd_stats[5], fd_stats[6], fd_stats[7],
-        fd_stats[8], fd_stats[9], "", "", "", ""))
-    # ROW 3: Filter labels
-    grid.append(row16("", "Tanggal (edit B2)", "Total", "Closed", "Wins", "Losses",
-        "Win Rate", "Net PnL", "LONG W/L", "SHORT W/L", "Best Trade", "Worst Trade",
-        "", "", "", ""))
+        fd_stats[8], fd_stats[9], "", "", "", "", ""))
+        
     # ROW 4: Spacer
     grid.append(empty16[:])
+    
     # ROW 5: Table header
     grid.append(row16("Tanggal","Total","Closed","W","L","Win Rate","Net PnL",
         "LONG","SHORT","Best Trade","Worst Trade","","","","",""))
@@ -877,17 +881,18 @@ def update_daily_pnl() -> None:
 
     # ── Write ─────────────────────────────────────────────────────
     try:
-        # Save B2 filter value before clearing
+        # Save A3 filter value before clearing
         try:
-            saved_filter = dws.acell("B2").value or ""
+            saved_filter = dws.acell("A3").value or ""
         except Exception:
             saved_filter = filter_date
 
         dws.clear()
         dws.update(f"A1:P{len(grid)}", grid, value_input_option="RAW")
-        # Restore B2 if user had typed a date (clear wipes it)
-        if saved_filter and saved_filter not in ("YYYY-MM-DD", ""):
-            dws.update("B2", [[saved_filter]], value_input_option="RAW")
+        
+        # Restore A3 if user had typed a date
+        if saved_filter and saved_filter not in ("YYYY-MM-DD", "", "🔍 Cari (Edit A3)"):
+            dws.update("A3", [[saved_filter]], value_input_option="RAW")
         time.sleep(0.4)
 
         # ── Batch formatting (single API call) ────────────────────
@@ -906,21 +911,39 @@ def update_daily_pnl() -> None:
             "textFormat":{"bold":True,"fontSize":13,
                 "foregroundColor":{"red":1,"green":1,"blue":1}}})
 
-        # Row 2: filter label (A2)
-        _cell_fmt(1,0,2,1, {"textFormat":{"bold":True,"fontSize":10,
-            "foregroundColor":_rgb(60,70,100)}})
-        # B2: yellow input cell
-        _cell_fmt(1,1,2,2, {"backgroundColor":_rgb(255,252,220),
-            "textFormat":{"bold":True,"fontSize":11,"foregroundColor":_rgb(180,100,0)},
-            "horizontalAlignment":"CENTER"})
-        # C2-L2: filter stats
-        _cell_fmt(1,2,2,12, {"textFormat":{"bold":True,"fontSize":10},
+        # Row 2: Filter Headers (Index 1)
+        _cell_fmt(1,0,2,11, {"backgroundColor":_rgb(240,242,246),
+            "textFormat":{"bold":True, "fontSize":9,"foregroundColor":{"red":0.4,"green":0.4,"blue":0.5}},
             "horizontalAlignment":"CENTER"})
 
-        # Row 3: label sub-row
-        _cell_fmt(2,0,3,12, {"backgroundColor":_rgb(240,242,246),
-            "textFormat":{"fontSize":8,"foregroundColor":{"red":0.5,"green":0.5,"blue":0.6}},
+        # Row 3: Filter Values (Index 2)
+        # A3: yellow input cell
+        _cell_fmt(2,0,3,1, {"backgroundColor":_rgb(255,252,220),
+            "textFormat":{"bold":True,"fontSize":10,"foregroundColor":_rgb(180,100,0)},
             "horizontalAlignment":"CENTER"})
+        
+        # B3-K3: Filter stats
+        _cell_fmt(2,1,3,11, {"textFormat":{"bold":True,"fontSize":11},
+            "horizontalAlignment":"CENTER"})
+            
+        # Color Win Rate (Col F, Index 5) if valid
+        try:
+            wr_str = str(fd_stats[4]).replace('%', '')
+            if wr_str != '—':
+                wr_val = float(wr_str)
+                wr_color = _rgb(46,139,87) if wr_val >= 50 else _rgb(180,50,50)
+                _cell_fmt(2, 5, 3, 6, {"textFormat":{"bold":True,"fontSize":11,"foregroundColor":wr_color}, "horizontalAlignment":"CENTER"})
+        except Exception: pass
+
+        # Color Net PnL (Col G, Index 6) if valid
+        try:
+            pnl_str = str(fd_stats[5])
+            if pnl_str != '—':
+                is_pos = '+' in pnl_str
+                is_neg = '-' in pnl_str
+                pnl_color = _rgb(30,130,60) if is_pos else (_rgb(180,50,50) if is_neg else _rgb(0,0,0))
+                _cell_fmt(2, 6, 3, 7, {"textFormat":{"bold":True,"fontSize":11,"foregroundColor":pnl_color}, "horizontalAlignment":"CENTER"})
+        except Exception: pass
 
         # Row 5: table header (index 4)
         _cell_fmt(4,0,5,11, {"backgroundColor":_rgb(50,65,90),
@@ -951,9 +974,9 @@ def update_daily_pnl() -> None:
             _cell_fmt(ri, 6, ri+1, 7, {"textFormat":{"bold":True,"fontSize":10,
                 "foregroundColor":_rgb(30,130,60) if d["pnl"]>=0 else _rgb(180,50,50)}})
 
-        # Column widths
-        for ci, px in [(0,105),(1,100),(2,55),(3,40),(4,40),(5,72),(6,92),
-                        (7,92),(8,92),(9,145),(10,145)]:
+        # Column widths aligned for 11 cols layout
+        for ci, px in [(0,105),(1,55),(2,55),(3,40),(4,40),(5,72),(6,85),
+                        (7,85),(8,85),(9,140),(10,140)]:
             reqs.append({"updateDimensionProperties": {
                 "range":{"sheetId":sid,"dimension":"COLUMNS",
                          "startIndex":ci,"endIndex":ci+1},
@@ -965,7 +988,10 @@ def update_daily_pnl() -> None:
             "properties":{"pixelSize":40},"fields":"pixelSize"}})
         reqs.append({"updateDimensionProperties": {
             "range":{"sheetId":sid,"dimension":"ROWS","startIndex":1,"endIndex":2},
-            "properties":{"pixelSize":36},"fields":"pixelSize"}})
+            "properties":{"pixelSize":25},"fields":"pixelSize"}}) # Filter labels
+        reqs.append({"updateDimensionProperties": {
+            "range":{"sheetId":sid,"dimension":"ROWS","startIndex":2,"endIndex":3},
+            "properties":{"pixelSize":32},"fields":"pixelSize"}}) # Filter values
 
         sh.batch_update({"requests": reqs})
         dws.freeze(rows=1, cols=1)
