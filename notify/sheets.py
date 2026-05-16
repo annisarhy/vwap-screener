@@ -48,6 +48,14 @@ import gspread
 from google.oauth2.service_account import Credentials
 import ccxt
 
+
+def _tofloat(val) -> float:
+    """Parse float dari string yang mungkin pakai koma desimal (locale ID/EU)."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    return float(str(val).replace(",", ".").strip())
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 SHEET_ID            = os.getenv("GOOGLE_SHEET_ID", "")
 SA_JSON_ENV         = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -392,7 +400,7 @@ def _update_live_prices() -> None:
         if curr is None:
             continue
         try:
-            entry = float(row[COL["Entry"] - 1])
+            entry = _tofloat(row[COL["Entry"] - 1])
         except (ValueError, IndexError):
             continue
 
@@ -405,7 +413,7 @@ def _update_live_prices() -> None:
     if updates:
         try:
             with _lock:
-                _ws.batch_update(updates, value_input_option="USER_ENTERED")
+                _ws.batch_update(updates, value_input_option="RAW")
             print(f"[sheets] live: updated {len(updates)} prices")
         except Exception as e:
             print(f"[sheets] live batch_update error: {e}")
@@ -452,10 +460,10 @@ def _run_backtest_resolver() -> None:
         tf   = row[COL["Timeframe"] - 1] or "15m"
 
         try:
-            entry = float(row[COL["Entry"] - 1])
-            sl    = float(row[COL["SL"]    - 1])
-            tp1   = float(row[COL["TP1"]   - 1])
-            tp2   = float(row[COL["TP2"]   - 1])
+            entry = _tofloat(row[COL["Entry"] - 1])
+            sl    = _tofloat(row[COL["SL"]    - 1])
+            tp1   = _tofloat(row[COL["TP1"]   - 1])
+            tp2   = _tofloat(row[COL["TP2"]   - 1])
         except (ValueError, IndexError):
             continue
 
@@ -486,7 +494,7 @@ def _run_backtest_resolver() -> None:
     if updates:
         try:
             with _lock:
-                _ws.batch_update(updates, value_input_option="USER_ENTERED")
+                _ws.batch_update(updates, value_input_option="RAW")
             print(f"[sheets] resolver: updated {len(updates)} statuses")
         except Exception as e:
             print(f"[sheets] resolver batch_update error: {e}")
