@@ -911,7 +911,7 @@ def update_dashboard() -> None:
 
     chart_anchor = len(grid)   # 0-indexed row for chart anchor
     grid.append(row14("📊  DISTRIBUSI HASIL","","","","","","","📈  PNL KUMULATIF (per sinyal)","","","","","",""))
-    for _ in range(14): grid.append(empty14[:])
+    for _ in range(18): grid.append(empty14[:])
 
     tbl_hdr = len(grid)
     grid.append(row14("Timestamp","Symbol","Dir","TF","Entry","SL","TP2","RR","Conv","Price","PnL %","Status"))
@@ -1022,7 +1022,7 @@ def update_dashboard() -> None:
                 "fontName": "Roboto",
                 "titleTextFormat": {"fontSize": 12, "bold": True},
                 "pieChart": {
-                    "legendPosition": "LABELED_LEGEND",
+                    "legendPosition": "BOTTOM_LEGEND",
                     "domain": {"sourceRange":{"sources":[{
                         "sheetId":sid,"startRowIndex":1,"endRowIndex":7,
                         "startColumnIndex":15,"endColumnIndex":16}]}},
@@ -1034,7 +1034,7 @@ def update_dashboard() -> None:
             },
             "position":{"overlayPosition":{
                 "anchorCell":{"sheetId":sid,"rowIndex":chart_anchor+1,"columnIndex":0},
-                "widthPixels":460,"heightPixels":310}}
+                "widthPixels":440,"heightPixels":340}}
         }}})
 
         # Line chart (only if ≥2 data points)
@@ -1067,8 +1067,13 @@ def update_dashboard() -> None:
                 },
                 "position":{"overlayPosition":{
                     "anchorCell":{"sheetId":sid,"rowIndex":chart_anchor+1,"columnIndex":7},
-                    "widthPixels":460,"heightPixels":310}}
+                    "widthPixels":440,"heightPixels":340}}
             }}})
+
+        # Hide chart data columns P-S (col index 15-18)
+        reqs.append({"updateDimensionProperties": {
+            "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":15,"endIndex":19},
+            "properties": {"hiddenByUser": True}, "fields":"hiddenByUser"}})
 
         if reqs: sh.batch_update({"requests": reqs})
         dws.freeze(rows=1)
