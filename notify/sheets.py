@@ -842,7 +842,7 @@ def update_daily_pnl() -> None:
 
     grid = []
     # ROW 1: Header
-    grid.append(row16("📅  DAILY PnL REVIEW","","","","","","","","","","","","","",f"🕐 {now_str}",""))
+    grid.append(row16("📅  DAILY PnL REVIEW"))
     
     # ROW 2: Filter Headers (Aligns with table columns)
     grid.append(row16("🔍 Cari (Edit A3)", "Total", "Closed", "W", "L",
@@ -1218,7 +1218,7 @@ def update_dashboard() -> None:
 
     grid = []
     # ── ROW 1: Header ────────────────────────────────────────────────
-    grid.append(row14("📊  VWAP SCREENER — PERFORMANCE DASHBOARD","","","","","","","","","","","",f"🕐 {now_str}",""))
+    grid.append(row14("📊  VWAP SCREENER — PERFORMANCE DASHBOARD"))
     grid.append(empty14[:])  # ROW 2
 
     # ── ROW 3-5: KPI cards ───────────────────────────────────────────
