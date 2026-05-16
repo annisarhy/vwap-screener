@@ -864,7 +864,8 @@ def update_dashboard() -> None:
     l_wr_bar = _spark_bar(l_wr, 100, 14)
     s_wr_bar = _spark_bar(s_wr, 100, 14)
 
-    # ── Build grid 14 kolom (A–N) ─────────────────────────────────────
+
+    # ── Build grid (A–G for LONG, H–N for SHORT) ─────────────────────
     empty14 = [""] * 14
     def row14(*vals):
         r = list(vals); r += [""] * (14 - len(r)); return r[:14]
@@ -877,67 +878,66 @@ def update_dashboard() -> None:
         sym  = r[COL["Symbol"] - 1];   dirn = r[COL["Direction"] - 1]
         tf   = r[COL["Timeframe"] - 1]; ent  = r[COL["Entry"] - 1]
         sl_v = r[COL["SL"] - 1];       tp2v = r[COL["TP2"] - 1]
-        rr   = r[COL["RR"] - 1] if len(r) > COL["RR"]-1 else ""
+        rr_v = r[COL["RR"] - 1] if len(r) > COL["RR"]-1 else ""
         conv = r[COL["Conviction"] - 1]
         curr = r[COL["Current Price"] - 1]
-        pnl  = r[COL["PnL %"] - 1];   stat = r[COL["Status"] - 1]
-        recent_grid.append(row14(ts, sym, dirn, tf, ent, sl_v, tp2v, rr, conv, curr, pnl, stat))
+        pnl_v = r[COL["PnL %"] - 1];  stat = r[COL["Status"] - 1]
+        recent_grid.append(row14(ts, sym, dirn, tf, ent, sl_v, tp2v, rr_v, conv, curr, pnl_v, stat))
 
     grid = []
+    # ROW 1: Header
     grid.append(row14("📊  VWAP SCREENER — PERFORMANCE DASHBOARD","","","","","","","","","","","", f"🕐 {now_str}",""))
+    # ROW 2: spacer
     grid.append(empty14[:])
-    grid.append(row14("TOTAL SINYAL","","","WIN RATE","","","TOTAL PnL","","","AVG PROFIT","","","AVG LOSS",""))
+    # ROW 3: KPI labels
+    grid.append(row14("TOTAL SINYAL","","","WIN RATE","","","TOTAL PnL","","","AVG WIN","","","AVG LOSS",""))
+    # ROW 4: KPI values
     pnl_str_v = f"{pnl_sign}{pnl_sum:.2f}%"
     grid.append(row14(total,"","",f"{win_rate:.1f}%","","",pnl_str_v,"","",f"+{avg_win:.2f}%","","",f"{avg_loss:.2f}%",""))
-    grid.append(row14(f"{open_n} open  |  {closed} closed","","",
+    # ROW 5: KPI sub
+    grid.append(row14(f"{open_n} open | {closed} closed","","",
         f"{tp3_n}TP3 · {tp2_n}TP2 · {tsl_n}TSL · {tp1_n}TP1 · {sl_n}SL","","",
-        "closed trades","","","per trade menang","","","per trade kalah",""))
+        "closed trades","","","","","","",""))
+    # ROW 6: spacer
     grid.append(empty14[:])
-    grid.append(row14("🟢  LONG","","","","","","","🔴  SHORT","","","","","",""))
-    grid.append(row14(f"Win Rate  {l_wr:.1f}%","","","","","","",f"Win Rate  {s_wr:.1f}%","","","","","",""))
+
+    # ROW 7: LONG / SHORT headers
+    l_sign = "+" if long_pnl >= 0 else ""
+    s_sign = "+" if short_pnl >= 0 else ""
+    l_pnl_s = f"{l_sign}{long_pnl:.2f}%"
+    s_pnl_s = f"{s_sign}{short_pnl:.2f}%"
+
+    grid.append(row14("🟢 LONG performance","","","","","","","🔴 SHORT performance","","","","","",""))
+    # ROW 8: Win rate bars
     grid.append(row14(l_wr_bar,"","","","","","",s_wr_bar,"","","","","",""))
-    for label, lv, sv in [
-        ("🚀 TP3 ✅", long_tp3, short_tp3), ("🏆 TP2", long_tp2, short_tp2),
-        ("💡 TSL ✅", long_tsl, short_tsl), ("🎯 TP1", long_tp1, short_tp1),
-        ("🛑 SL ❌", long_sl, short_sl),
-        ("Net PnL", f"{'+'if long_pnl>=0 else''}{long_pnl:.2f}%",
-                    f"{'+'if short_pnl>=0 else''}{short_pnl:.2f}%"),
-    ]:
-        grid.append(row14(label, lv, "", "", "", "", "", label, sv, "", "", "", "", ""))
+    # ROW 9: spacer
     grid.append(empty14[:])
+    # ROW 10-14: Stats
+    grid.append(row14("TP3 ✅","","","","","",long_tp3, "TP3 ✅","","","","","",short_tp3))
+    grid.append(row14("TP2","","","","","",long_tp2, "TP2","","","","","",short_tp2))
+    grid.append(row14("TSL ✅","","","","","",long_tsl, "TSL ✅","","","","","",short_tsl))
+    grid.append(row14("TP1","","","","","",long_tp1, "TP1","","","","","",short_tp1))
+    grid.append(row14("SL ❌","","","","","",long_sl, "SL ❌","","","","","",short_sl))
+    # ROW 15-16: Win rate + Net PnL
+    grid.append(row14("Win rate","","","","","",f"{l_wr:.1f}%", "Win rate","","","","","",f"{s_wr:.1f}%"))
+    grid.append(row14("Net PnL","","","","","",l_pnl_s, "Net PnL","","","","","",s_pnl_s))
+    # ROW 17: spacer
+    grid.append(empty14[:])
+    # ROW 18-19: Overall win rate
     grid.append(row14("📈  OVERALL WIN RATE","","","","","","","","","","","","",""))
-    grid.append(row14(f"{win_rate:.1f}%  {wr_bar}  ({wins}W / {sl_n}L  dari {closed} closed)","","","","","","","","","","","","",""))
+    grid.append(row14(f"{win_rate:.1f}%  {wr_bar}  ({wins}W / {sl_n}L dari {closed} closed)","","","","","","","","","","","","",""))
+    # ROW 20: spacer
     grid.append(empty14[:])
-
-    chart_anchor = len(grid)   # 0-indexed row for chart anchor
-    grid.append(row14("📊  DISTRIBUSI HASIL","","","","","","","📈  PNL KUMULATIF (per sinyal)","","","","","",""))
-    for _ in range(18): grid.append(empty14[:])
-
+    # ROW 21: Table header
     tbl_hdr = len(grid)
     grid.append(row14("Timestamp","Symbol","Dir","TF","Entry","SL","TP2","RR","Conv","Price","PnL %","Status"))
+    # ROW 22+: Data
     grid.extend(recent_grid)
-
-    # ── Chart source data (col P-S) ───────────────────────────────────
-    dist_labels = ["TP3 ✅", "TP2", "TSL ✅", "TP1", "SL ❌", "Open"]
-    dist_values = [tp3_n, tp2_n, tsl_n, tp1_n, sl_n, open_n]
-    cum_pnl = []; running = 0.0
-    for pv in pnl_history: running += pv; cum_pnl.append(round(running, 2))
-
-    chart_data = [["Label", "Count", "Signal #", "PnL Kum %"]]
-    for i in range(6):
-        rn = i+1 if i < len(cum_pnl) else ""
-        cp = cum_pnl[i] if i < len(cum_pnl) else ""
-        chart_data.append([dist_labels[i], dist_values[i], rn, cp])
-    for i in range(6, len(cum_pnl)):
-        chart_data.append(["", "", i+1, cum_pnl[i]])
 
     # ── Write ─────────────────────────────────────────────────────────
     try:
         dws.clear()
         dws.update(f"A1:N{len(grid)}", grid, value_input_option="RAW")
-        time.sleep(0.3)
-        if chart_data:
-            dws.update(f"P1:S{len(chart_data)}", chart_data, value_input_option="RAW")
         time.sleep(0.3)
 
         # ── Formatting ────────────────────────────────────────────────
@@ -955,29 +955,47 @@ def update_dashboard() -> None:
         _fmt(dws, "G4", {"textFormat": {"bold":True,"fontSize":18,"foregroundColor": pnl_c}})
         _fmt(dws, "A5:N5", {"textFormat": {"fontSize":9,"foregroundColor":{"red":0.5,"green":0.5,"blue":0.6}},
             "horizontalAlignment": "CENTER"})
-        _fmt(dws, "A7:G7", {"backgroundColor": _rgb(232,248,238),
-            "textFormat": {"bold":True,"fontSize":11,"foregroundColor": _rgb(30,120,70)}})
-        _fmt(dws, "H7:N7", {"backgroundColor": _rgb(255,235,235),
-            "textFormat": {"bold":True,"fontSize":11,"foregroundColor": _rgb(160,40,40)}})
-        _fmt(dws, "A8:G8", {"textFormat": {"bold":True,"fontSize":11}})
-        _fmt(dws, "H8:N8", {"textFormat": {"bold":True,"fontSize":11}})
-        _fmt(dws, "A9:G9", {"textFormat": {"fontFamily":"Courier New","fontSize":10,
+
+        # LONG header
+        _fmt(dws, "A7:G7", {"backgroundColor": _rgb(245,252,248),
+            "textFormat": {"bold":True,"fontSize":12,"foregroundColor": _rgb(30,120,70)}})
+        # SHORT header
+        _fmt(dws, "H7:N7", {"backgroundColor": _rgb(253,245,245),
+            "textFormat": {"bold":True,"fontSize":12,"foregroundColor": _rgb(160,40,40)}})
+        # Win rate bars
+        _fmt(dws, "A8:G8", {"textFormat": {"fontFamily":"Courier New","fontSize":10,
             "foregroundColor": _rgb(46,139,87)}})
-        _fmt(dws, "H9:N9", {"textFormat": {"fontFamily":"Courier New","fontSize":10,
-            "foregroundColor": _rgb(160,40,40)}})
-        _fmt(dws, "A18:N18", {"backgroundColor": _rgb(245,248,255),
+        _fmt(dws, "H8:N8", {"textFormat": {"fontFamily":"Courier New","fontSize":10,
+            "foregroundColor": _rgb(180,50,50)}})
+
+        # Stats values — right-align col G and N
+        for row_n in range(10, 17):
+            _fmt(dws, f"G{row_n}", {"textFormat": {"bold":True}, "horizontalAlignment": "RIGHT"})
+            _fmt(dws, f"N{row_n}", {"textFormat": {"bold":True}, "horizontalAlignment": "RIGHT"})
+
+        # Win rate color (row 15)
+        _fmt(dws, "G15", {"textFormat": {"bold":True,"foregroundColor":
+            _rgb(46,139,87) if l_wr>=50 else _rgb(180,50,50)}, "horizontalAlignment": "RIGHT"})
+        _fmt(dws, "N15", {"textFormat": {"bold":True,"foregroundColor":
+            _rgb(46,139,87) if s_wr>=50 else _rgb(180,50,50)}, "horizontalAlignment": "RIGHT"})
+
+        # Net PnL color (row 16)
+        _fmt(dws, "G16", {"textFormat": {"bold":True,"foregroundColor":
+            _rgb(46,139,87) if long_pnl>=0 else _rgb(180,50,50)}, "horizontalAlignment": "RIGHT"})
+        _fmt(dws, "N16", {"textFormat": {"bold":True,"foregroundColor":
+            _rgb(46,139,87) if short_pnl>=0 else _rgb(180,50,50)}, "horizontalAlignment": "RIGHT"})
+
+        # Overall bar (row 19)
+        _fmt(dws, "A19:N19", {"backgroundColor": _rgb(245,248,255),
             "textFormat": {"fontFamily":"Courier New","fontSize":11,"bold":True}})
 
-        cr = chart_anchor + 1
-        _fmt(dws, f"A{cr}:G{cr}", {"backgroundColor": _rgb(248,248,252),
-            "textFormat": {"bold":True,"fontSize":11,"foregroundColor": _rgb(60,70,90)}})
-        _fmt(dws, f"H{cr}:N{cr}", {"backgroundColor": _rgb(248,248,252),
-            "textFormat": {"bold":True,"fontSize":11,"foregroundColor": _rgb(60,70,90)}})
-
+        # Table header
         thr = tbl_hdr + 1
         _fmt(dws, f"A{thr}:N{thr}", {"backgroundColor": _rgb(50,65,90),
             "textFormat": {"bold":True,"fontSize":10,"foregroundColor":{"red":1,"green":1,"blue":1}},
             "horizontalAlignment": "CENTER"})
+
+        # Data rows
         for i, r in enumerate(recent_grid):
             rn = thr + 1 + i; stat = r[11] if len(r)>11 else ""
             if "TP3" in stat:                              bg = _rgb(200,245,210)
@@ -993,11 +1011,11 @@ def update_dashboard() -> None:
             except Exception: pc = _rgb(80,80,80)
             _fmt(dws, f"K{rn}", {"textFormat": {"bold":True,"foregroundColor": pc}})
 
-        # ── Batch: widths + charts ────────────────────────────────────
+        # ── Batch: widths + cleanup charts ────────────────────────────
         sh = _gc.open_by_key(SHEET_ID); sid = dws.id
         reqs = []
-        for ci, px in [(0,150),(1,80),(2,70),(3,45),(4,90),(5,90),
-                        (6,90),(7,45),(8,90),(9,100),(10,75),(11,80)]:
+        for ci, px in [(0,130),(1,80),(2,65),(3,40),(4,85),(5,85),
+                        (6,85),(7,80),(8,85),(9,95),(10,70),(11,75)]:
             reqs.append({"updateDimensionProperties": {
                 "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":ci,"endIndex":ci+1},
                 "properties": {"pixelSize":px}, "fields":"pixelSize"}})
@@ -1008,76 +1026,16 @@ def update_dashboard() -> None:
             "range":{"sheetId":sid,"dimension":"ROWS","startIndex":3,"endIndex":4},
             "properties":{"pixelSize":40},"fields":"pixelSize"}})
 
-        # Delete old charts
+        # Delete leftover charts from previous version
         meta = sh.fetch_sheet_metadata()
         for s in meta.get("sheets",[]):
             if s["properties"]["sheetId"] == sid:
                 for c in s.get("charts",[]):
                     reqs.append({"deleteEmbeddedObject":{"objectId":c["chartId"]}})
 
-        # Donut chart
-        reqs.append({"addChart":{"chart":{
-            "spec": {
-                "title": "Distribusi Hasil",
-                "fontName": "Roboto",
-                "titleTextFormat": {"fontSize": 12, "bold": True},
-                "pieChart": {
-                    "legendPosition": "BOTTOM_LEGEND",
-                    "domain": {"sourceRange":{"sources":[{
-                        "sheetId":sid,"startRowIndex":1,"endRowIndex":7,
-                        "startColumnIndex":15,"endColumnIndex":16}]}},
-                    "series": {"sourceRange":{"sources":[{
-                        "sheetId":sid,"startRowIndex":1,"endRowIndex":7,
-                        "startColumnIndex":16,"endColumnIndex":17}]}},
-                    "pieHole": 0.4,
-                }
-            },
-            "position":{"overlayPosition":{
-                "anchorCell":{"sheetId":sid,"rowIndex":chart_anchor+1,"columnIndex":0},
-                "widthPixels":440,"heightPixels":340}}
-        }}})
-
-        # Line chart (only if ≥2 data points)
-        pnl_rows = len(cum_pnl) + 1
-        if len(cum_pnl) >= 2:
-            lc = _rgb(46,139,87) if cum_pnl[-1]>=0 else _rgb(180,50,50)
-            reqs.append({"addChart":{"chart":{
-                "spec": {
-                    "title": "PnL Kumulatif (per sinyal)",
-                    "fontName": "Roboto",
-                    "titleTextFormat": {"fontSize": 12, "bold": True},
-                    "basicChart": {
-                        "chartType": "LINE",
-                        "legendPosition": "NO_LEGEND",
-                        "axis": [
-                            {"position":"BOTTOM_AXIS","title":""},
-                            {"position":"LEFT_AXIS","title":"PnL %"},
-                        ],
-                        "domains": [{"domain":{"sourceRange":{"sources":[{
-                            "sheetId":sid,"startRowIndex":0,"endRowIndex":pnl_rows,
-                            "startColumnIndex":17,"endColumnIndex":18}]}}}],
-                        "series": [{"series":{"sourceRange":{"sources":[{
-                            "sheetId":sid,"startRowIndex":0,"endRowIndex":pnl_rows,
-                            "startColumnIndex":18,"endColumnIndex":19}]}},
-                            "type":"LINE","color":lc,
-                            "lineStyle":{"width":3},
-                            "pointStyle":{"size":5,"shape":"CIRCLE"}}],
-                        "headerCount": 1,
-                    }
-                },
-                "position":{"overlayPosition":{
-                    "anchorCell":{"sheetId":sid,"rowIndex":chart_anchor+1,"columnIndex":7},
-                    "widthPixels":440,"heightPixels":340}}
-            }}})
-
-        # Hide chart data columns P-S (col index 15-18)
-        reqs.append({"updateDimensionProperties": {
-            "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":15,"endIndex":19},
-            "properties": {"hiddenByUser": True}, "fields":"hiddenByUser"}})
-
         if reqs: sh.batch_update({"requests": reqs})
         dws.freeze(rows=1)
-        print(f"[dashboard] ✅ Updated — WR={win_rate:.1f}% PnL={pnl_sign}{pnl_sum:.2f}% ({len(recent_grid)} rows, 2 charts)")
+        print(f"[dashboard] ✅ Updated — WR={win_rate:.1f}% PnL={pnl_sign}{pnl_sum:.2f}% ({len(recent_grid)} rows)")
     except Exception as e:
         print(f"[dashboard] write error: {e}")
 
