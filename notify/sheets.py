@@ -870,7 +870,7 @@ def update_dashboard() -> None:
     def row14(*vals):
         r = list(vals); r += [""] * (14 - len(r)); return r[:14]
 
-    recent = rows[-15:][::-1]
+    recent = rows[-5:][::-1]
     recent_grid = []
     for r in recent:
         if len(r) <= COL["Status"] - 1: continue
@@ -937,6 +937,10 @@ def update_dashboard() -> None:
     # ── Write ─────────────────────────────────────────────────────────
     try:
         dws.clear()
+        # Reset formatting to remove ghost colored rows from old dashboard
+        _fmt(dws, "A1:N50", {"backgroundColor": {"red":1,"green":1,"blue":1},
+            "textFormat": {"bold":False,"fontSize":10,"foregroundColor":{"red":0,"green":0,"blue":0},
+                           "fontFamily":"Arial"}})
         dws.update(f"A1:N{len(grid)}", grid, value_input_option="RAW")
         time.sleep(0.3)
 
