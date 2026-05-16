@@ -873,68 +873,89 @@ def update_daily_pnl() -> None:
 
     # ── Write ─────────────────────────────────────────────────────
     try:
-        # Only clear rows 1, 2, 3 and 5 onwards (preserve B2 user input area)
-        dws.batch_clear(["A1:P1", "C2:P2", "A3:P3", "A4:P4", f"A5:P{4+len(sorted_dates)+1}"])
+        # Save B2 filter value before clearing
+        try:
+            saved_filter = dws.acell("B2").value or ""
+        except Exception:
+            saved_filter = filter_date
+
+        dws.clear()
         dws.update(f"A1:P{len(grid)}", grid, value_input_option="RAW")
-        time.sleep(0.3)
+        # Restore B2 if user had typed a date (clear wipes it)
+        if saved_filter and saved_filter not in ("YYYY-MM-DD", ""):
+            dws.update("B2", [[saved_filter]], value_input_option="RAW")
+        time.sleep(0.4)
 
-        # ── Formatting ────────────────────────────────────────────
-        # Row 1: Header bar
-        _fmt(dws, "A1:P1", {"backgroundColor": _rgb(30,40,58),
-            "textFormat": {"bold":True,"fontSize":13,"foregroundColor":{"red":1,"green":1,"blue":1}}})
-
-        # Row 2: Filter row — highlight filter date cell B2
-        _fmt(dws, "A2", {"textFormat": {"bold":True,"fontSize":10,"foregroundColor": _rgb(60,70,100)}})
-        _fmt(dws, "B2", {"backgroundColor": _rgb(255,252,220),
-            "textFormat": {"bold":True,"fontSize":11,"foregroundColor": _rgb(180,100,0)},
-            "horizontalAlignment": "CENTER"})
-        # Filter stats cells C2-L2
-        _fmt(dws, "C2:L2", {"textFormat": {"bold":True,"fontSize":10},
-            "horizontalAlignment": "CENTER"})
-
-        # Row 3: Filter labels
-        _fmt(dws, "A3:L3", {"backgroundColor": _rgb(240,242,246),
-            "textFormat": {"bold":False,"fontSize":8,"foregroundColor":{"red":0.5,"green":0.5,"blue":0.6}},
-            "horizontalAlignment": "CENTER"})
-
-        # Row 5: Table header
-        _fmt(dws, "A5:K5", {"backgroundColor": _rgb(50,65,90),
-            "textFormat": {"bold":True,"fontSize":10,"foregroundColor":{"red":1,"green":1,"blue":1}},
-            "horizontalAlignment": "CENTER"})
-
-        # Data rows — alternate shading + color PnL
+        # ── Batch formatting (single API call) ────────────────────
         sh  = _gc.open_by_key(SHEET_ID); sid = dws.id
         reqs = []
+
+        def _cell_fmt(r0, c0, r1, c1, fmt_props):
+            reqs.append({"repeatCell": {
+                "range": {"sheetId":sid,"startRowIndex":r0,"endRowIndex":r1,
+                          "startColumnIndex":c0,"endColumnIndex":c1},
+                "cell": {"userEnteredFormat": fmt_props},
+                "fields": "userEnteredFormat"}})
+
+        # Row 1: header bar
+        _cell_fmt(0,0,1,16, {"backgroundColor":_rgb(30,40,58),
+            "textFormat":{"bold":True,"fontSize":13,
+                "foregroundColor":{"red":1,"green":1,"blue":1}}})
+
+        # Row 2: filter label (A2)
+        _cell_fmt(1,0,2,1, {"textFormat":{"bold":True,"fontSize":10,
+            "foregroundColor":_rgb(60,70,100)}})
+        # B2: yellow input cell
+        _cell_fmt(1,1,2,2, {"backgroundColor":_rgb(255,252,220),
+            "textFormat":{"bold":True,"fontSize":11,"foregroundColor":_rgb(180,100,0)},
+            "horizontalAlignment":"CENTER"})
+        # C2-L2: filter stats
+        _cell_fmt(1,2,2,12, {"textFormat":{"bold":True,"fontSize":10},
+            "horizontalAlignment":"CENTER"})
+
+        # Row 3: label sub-row
+        _cell_fmt(2,0,3,12, {"backgroundColor":_rgb(240,242,246),
+            "textFormat":{"fontSize":8,"foregroundColor":{"red":0.5,"green":0.5,"blue":0.6}},
+            "horizontalAlignment":"CENTER"})
+
+        # Row 5: table header (index 4)
+        _cell_fmt(4,0,5,11, {"backgroundColor":_rgb(50,65,90),
+            "textFormat":{"bold":True,"fontSize":10,
+                "foregroundColor":{"red":1,"green":1,"blue":1}},
+            "horizontalAlignment":"CENTER"})
+
+        # Data rows alternating background
         for i, dk in enumerate(sorted_dates):
-            rn = 6 + i
+            ri = 5 + i   # 0-indexed row
             d  = daily[dk]
-            pnl_positive = d["pnl"] >= 0
-            # Highlight today / filter date
             if dk == filter_date:
                 bg = _rgb(255,248,200)
             elif i % 2 == 0:
                 bg = _rgb(252,252,255)
             else:
                 bg = _rgb(245,246,250)
-            _fmt(dws, f"A{rn}:K{rn}", {"backgroundColor": bg, "textFormat": {"fontSize":10}})
-            # Date col bold
-            _fmt(dws, f"A{rn}", {"textFormat": {"bold":True,"fontSize":10}})
-            # PnL col colored
-            _fmt(dws, f"G{rn}", {"textFormat": {"bold":True,"fontSize":10,"foregroundColor":
-                _rgb(30,130,60) if pnl_positive else _rgb(180,50,50)}})
-            # Win rate col colored
-            closed = d["wins"] + d["losses"]
-            wr_val = d["wins"] / closed * 100 if closed > 0 else 0.0
-            _fmt(dws, f"F{rn}", {"textFormat": {"foregroundColor":
-                _rgb(46,139,87) if wr_val >= 50 else _rgb(180,50,50)}})
+            _cell_fmt(ri, 0, ri+1, 11, {"backgroundColor":bg, "textFormat":{"fontSize":10}})
+            # Date bold
+            _cell_fmt(ri, 0, ri+1, 1, {"textFormat":{"bold":True,"fontSize":10},
+                "backgroundColor":bg})
+            # Win Rate (col F = index 5) colored
+            closed_d = d["wins"] + d["losses"]
+            wr_v = d["wins"]/closed_d*100 if closed_d > 0 else 0.0
+            _cell_fmt(ri, 5, ri+1, 6, {"textFormat":{"bold":True,"fontSize":10,
+                "foregroundColor":_rgb(46,139,87) if wr_v>=50 else _rgb(180,50,50)}})
+            # Net PnL (col G = index 6) colored
+            _cell_fmt(ri, 6, ri+1, 7, {"textFormat":{"bold":True,"fontSize":10,
+                "foregroundColor":_rgb(30,130,60) if d["pnl"]>=0 else _rgb(180,50,50)}})
 
         # Column widths
-        for ci, px in [(0,105),(1,55),(2,55),(3,40),(4,40),(5,70),(6,90),
-                        (7,90),(8,90),(9,140),(10,140)]:
+        for ci, px in [(0,105),(1,100),(2,55),(3,40),(4,40),(5,72),(6,92),
+                        (7,92),(8,92),(9,145),(10,145)]:
             reqs.append({"updateDimensionProperties": {
-                "range": {"sheetId":sid,"dimension":"COLUMNS","startIndex":ci,"endIndex":ci+1},
-                "properties": {"pixelSize":px}, "fields":"pixelSize"}})
-        # Row heights
+                "range":{"sheetId":sid,"dimension":"COLUMNS",
+                         "startIndex":ci,"endIndex":ci+1},
+                "properties":{"pixelSize":px},"fields":"pixelSize"}})
+
+        # Row heights: header taller
         reqs.append({"updateDimensionProperties": {
             "range":{"sheetId":sid,"dimension":"ROWS","startIndex":0,"endIndex":1},
             "properties":{"pixelSize":40},"fields":"pixelSize"}})
@@ -942,11 +963,14 @@ def update_daily_pnl() -> None:
             "range":{"sheetId":sid,"dimension":"ROWS","startIndex":1,"endIndex":2},
             "properties":{"pixelSize":36},"fields":"pixelSize"}})
 
-        if reqs: sh.batch_update({"requests": reqs})
+        sh.batch_update({"requests": reqs})
         dws.freeze(rows=1, cols=1)
-        print(f"[daily] ✅ Updated — {len(sorted_dates)} days")
+        print(f"[daily] ✅ Updated — {len(sorted_dates)} days, filter={filter_date or 'none'}")
     except Exception as e:
+        import traceback
         print(f"[daily] write error: {e}")
+        traceback.print_exc()
+
 
 
 def _get_dash_ws():
